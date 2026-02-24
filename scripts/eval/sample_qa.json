@@ -1,0 +1,25 @@
+[
+  {
+    "question": "What is the main topic discussed in the document?",
+    "answer": "The document discusses enterprise security policies for password management.",
+    "contexts": [
+      "All passwords must be at least 12 characters long and include uppercase, lowercase, digits, and symbols.",
+      "Employees must change their passwords every 90 days. Reuse of the last 5 passwords is prohibited."
+    ]
+  },
+  {
+    "question": "How often must employees change their passwords?",
+    "answer": "Every 90 days.",
+    "contexts": [
+      "Employees must change their passwords every 90 days. Reuse of the last 5 passwords is prohibited.",
+      "Password rotation is enforced by the IT security system and non-compliance triggers an account lock."
+    ]
+  },
+  {
+    "question": "What is the minimum password length?",
+    "answer": "The minimum password length is 12 characters.",
+    "contexts": [
+      "All passwords must be at least 12 characters long and include uppercase, lowercase, digits, and symbols."
+    ]
+  }
+]

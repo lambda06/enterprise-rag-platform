@@ -5,7 +5,7 @@ Document upload and ingestion API routes.
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, Body
+from fastapi import APIRouter, Body, File, HTTPException, Query, UploadFile
 
 from app.ingestion.pipeline import ingest
 
@@ -64,20 +64,39 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
 
 
 @router.post("/chat")
-async def chat(question: dict = Body(...)) -> dict:
-    """Simple chat endpoint that answers a question using the RAG pipeline.
+async def chat(
+    question: dict = Body(...),
+    evaluate: bool = Query(
+        default=False,
+        description=(
+            "Set to true to run inline RAGAS evaluation on this response. "
+            "Adds latency due to extra LLM calls. "
+            "Scores are returned under the 'evaluation' key."
+        ),
+    ),
+) -> dict:
+    """Answer a question using the RAG pipeline.
 
-    Expects JSON body: {"question": "..."}
-    Returns: {"answer": str, "source_chunks": [...], "chunk_count": int}
+    Expects JSON body: ``{"question": "..."}``
+
+    Query params:
+        evaluate: bool (default false) — append RAGAS metric scores to response.
+
+    Returns:
+        ``{"answer": str, "source_chunks": [...], "chunk_count": int}``
+        and optionally ``{"evaluation": {"faithfulness": 0.85, ...}}``
     """
     q = question.get("question") if isinstance(question, dict) else None
     if not q or not isinstance(q, str):
-        raise HTTPException(status_code=400, detail="Request body must include a 'question' string")
+        raise HTTPException(
+            status_code=400,
+            detail="Request body must include a 'question' string",
+        )
 
     from app.rag.pipeline import rag_pipeline
 
     try:
-        result = await rag_pipeline.query(q)
+        result = await rag_pipeline.query(q, evaluate=evaluate)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 

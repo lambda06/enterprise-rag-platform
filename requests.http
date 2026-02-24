@@ -1,0 +1,121 @@
+### Enterprise RAG Platform — REST Client Tests
+### Base URL: http://localhost:8000
+###
+### Run these requests IN ORDER (top to bottom) on a fresh server start.
+### Requires: sample.pdf in the project root, or update the path below.
+
+@baseUrl = http://localhost:8000
+
+# =============================================================================
+# REQUEST 1 — Health Check
+# =============================================================================
+# What we're testing:
+#   The server is up and the FastAPI app loaded without import errors.
+# What to look for:
+#   HTTP 200 with body {"status": "ok"}
+#   If you get a 500 here, check the uvicorn terminal for startup errors.
+# =============================================================================
+
+GET {{baseUrl}}/health
+
+###
+
+# =============================================================================
+# REQUEST 2 — PDF Upload & Ingestion
+# =============================================================================
+# What we're testing:
+#   The full ingestion pipeline: PDF parse → chunk → embed → upsert to Qdrant.
+# What to look for:
+#   HTTP 200 with:
+#     "status": "completed"
+#     "total_pages": <number>    (should be > 0)
+#     "total_chunks": <number>  (should be > 0; expect ~5-50 for a short PDF)
+#   If status is "failed", the "error" field will explain what went wrong.
+#   Check uvicorn logs for per-step INFO lines (Parsed N pages, Embedded N chunks).
+# =============================================================================
+
+POST {{baseUrl}}/api/v1/documents/upload
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="file"; filename="sample.pdf"
+Content-Type: application/pdf
+
+< ./sample.pdf
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+###
+
+# =============================================================================
+# REQUEST 3 — Basic Chat (no evaluation)
+# =============================================================================
+# What we're testing:
+#   The core RAG pipeline: embed query → Qdrant dense search → Groq LLM answer.
+# What to look for:
+#   HTTP 200 with:
+#     "answer": <non-empty string grounded in the uploaded PDF>
+#     "source_chunks": array of retrieved text chunks (length == chunk_count)
+#     "chunk_count": number between 1 and 5
+#   The response should NOT have an "evaluation" key (opt-in only).
+#   Check uvicorn logs — no RAGAS lines should appear for this request.
+# =============================================================================
+
+POST {{baseUrl}}/api/v1/documents/chat
+Content-Type: application/json
+
+{
+  "question": "what is this document about?"
+}
+
+###
+
+# =============================================================================
+# REQUEST 4 — Chat WITH Evaluation (?evaluate=true)
+# =============================================================================
+# What we're testing:
+#   The opt-in RAGAS inline evaluation path.
+#   Same question as Request 3 so you can compare answers.
+# What to look for:
+#   HTTP 200 with all fields from Request 3 PLUS:
+#     "evaluation": {
+#       "faithfulness": <0.0–1.0>        — is the answer grounded in context?
+#       "response_relevancy": <0.0–1.0>  — is the answer on-topic?
+#       "llm_context_precision_without_reference": <0.0–1.0>  — are chunks useful?
+#     }
+#   A faithfulness score < 0.5 suggests the LLM is hallucinating beyond context.
+#   Check uvicorn logs for:
+#     INFO  Running RAGAS evaluation for question: ...
+#     INFO  RAGAS scores — faithfulness=X.XXXX  response_relevancy=X.XXXX ...
+#   This request will be noticeably slower (extra Groq API calls for evaluation).
+# =============================================================================
+
+POST {{baseUrl}}/api/v1/documents/chat?evaluate=true
+Content-Type: application/json
+
+{
+  "question": "what is this document about?"
+}
+
+###
+
+# =============================================================================
+# REQUEST 5 — Repeat Chat (cache hit test)
+# =============================================================================
+# What we're testing:
+#   Whether a second identical query gets served faster (future Redis cache).
+#   Currently Redis caching is not yet implemented, so this request exercises
+#   the same pipeline path as Request 3 — useful as a latency baseline.
+# What to look for:
+#   HTTP 200 with the same structure as Request 3.
+#   Compare response time to Request 3 — they should be similar (no cache yet).
+#   Once Redis caching is implemented, this should be significantly faster and
+#   uvicorn logs should show a cache-hit log line instead of a Qdrant query.
+#   No "evaluation" key (we're testing the no-eval path here).
+# =============================================================================
+
+POST {{baseUrl}}/api/v1/documents/chat
+Content-Type: application/json
+
+{
+  "question": "what is this document about?"
+}

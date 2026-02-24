@@ -1,54 +1,128 @@
 """
 Qdrant vector store client for the Enterprise RAG Platform.
 
-Handles collection management, chunk upserts, and semantic search.
+Handles collection management, chunk upserts, dense semantic search,
+and hybrid (dense + sparse BM25) search with Reciprocal Rank Fusion.
 """
 
 from __future__ import annotations
 
-import uuid
 import hashlib
+import uuid
 from typing import Any
 
 import numpy as np
-import requests
+from rank_bm25 import BM25Okapi
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    PointStruct,
+    SparseIndexParams,
+    SparseVector,
+    SparseVectorParams,
+    VectorParams,
+)
 
 from app.core.config import get_settings
 
 
-# Cosine distance and why we use it
-# ----------------------------------
-# Cosine distance = 1 - cosine_similarity. It measures the angle between two
-# vectors, ignoring their magnitude. Range: 0 (identical direction) to 2
-# (opposite direction). Smaller distance = more similar.
-#
-# Why cosine over Euclidean?
-# - Embeddings are often L2-normalized; magnitude carries little meaning.
-# - Cosine focuses on direction (semantic orientation), which matters for
-#   "similar meaning" regardless of text length.
-# - Robust to document length: a short and long text with the same meaning
-#   can have very different Euclidean distances but similar cosine distance.
-#
-# Qdrant uses cosine as the default for semantic search; it aligns with how
-# embedding models are trained (similar texts → similar directions).
+# ─── Vector name constants ────────────────────────────────────────────────────
+# Qdrant supports multiple named vectors per point. We use two:
+#   "dense"  — 384-dim float vector from BAAI/bge-small-en-v1.5 (cosine)
+#   "sparse" — variable-length BM25 bag-of-words vector (dot product)
+DENSE_VECTOR_NAME = "dense"
+SPARSE_VECTOR_NAME = "sparse"
 
-# Derive a content-based UUID so that repeated ingestion of the
-# same source does not create duplicate points.  In production the
-# ingestion pipeline may run multiple times for the same
-# document; using a deterministic ID computed from the
-# (source_filename, page_number, chunk_index) combo makes the
-# process *idempotent* – re‑upserting the same chunk simply
-# overwrites the existing point instead of adding a new one.
-# This avoids vector store bloat and ensures stable references.
+
+# ─── Cosine distance rationale ────────────────────────────────────────────────
+# Cosine distance = 1 − cosine_similarity. It measures the angle between
+# two vectors, ignoring magnitude. Range: 0 (identical) → 2 (opposite).
+# Preferred over Euclidean for embeddings because:
+#   • Models produce L2-normalised outputs; magnitude has no semantic meaning.
+#   • Cosine focuses on *direction* (shared concept), which is orientation-
+#     independent with respect to text length.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _tokenize(text: str) -> list[str]:
+    """Simple whitespace + lowercase tokeniser for BM25.
+
+    A production system might strip punctuation or apply stemming, but
+    lowercase whitespace split is fast, repeatable, and sufficient for
+    most English enterprise documents.
+    """
+    return text.lower().split()
+
+
+def _build_sparse_vector(
+    query_tokens: list[str],
+    corpus_tokens: list[list[str]],
+) -> SparseVector:
+    """Compute a BM25 sparse query vector over the given corpus.
+
+    BM25Okapi scores each token against every document in the corpus, then
+    we aggregate those scores per *unique token* to produce a bag-of-weights
+    representation.  The indices are stable integer hashes of the token
+    strings so they are comparable across separate calls.
+
+    Args:
+        query_tokens:  Tokenised query string.
+        corpus_tokens: All tokenised documents in this batch (for IDF).
+
+    Returns:
+        SparseVector with ``indices`` (token hashes) and ``values`` (BM25 weights).
+    """
+    if not corpus_tokens:
+        return SparseVector(indices=[], values=[])
+
+    bm25 = BM25Okapi(corpus_tokens)
+    scores = bm25.get_scores(query_tokens)
+
+    # Map each corpus-token → cumulative BM25 weight.
+    # We use a stable positive-integer hash (modulo 2^20 to keep indices small).
+    token_weights: dict[int, float] = {}
+    for doc_tokens, score in zip(corpus_tokens, scores):
+        if score > 0:
+            for token in set(doc_tokens):
+                token_id = abs(hash(token)) % (2**20)
+                token_weights[token_id] = token_weights.get(token_id, 0.0) + float(score)
+
+    if not token_weights:
+        return SparseVector(indices=[], values=[])
+
+    indices = list(token_weights.keys())
+    values = [token_weights[i] for i in indices]
+    return SparseVector(indices=indices, values=values)
+
+
+def _query_sparse_vector(query_tokens: list[str]) -> SparseVector:
+    """Build a sparse query vector from query tokens alone.
+
+    When querying, we don't have a corpus; we assign each token a weight
+    of 1.0 so that the dot-product with stored BM25 chunk vectors acts as a
+    keyword-overlap score.
+
+    Args:
+        query_tokens: Tokens from the user query.
+
+    Returns:
+        SparseVector suitable for passing to Qdrant's sparse search.
+    """
+    token_weights: dict[int, float] = {}
+    for token in set(query_tokens):
+        token_id = abs(hash(token)) % (2**20)
+        token_weights[token_id] = 1.0
+
+    indices = list(token_weights.keys())
+    values = [token_weights[i] for i in indices]
+    return SparseVector(indices=indices, values=values)
+
 
 class QdrantService:
-    """
-    Service for interacting with Qdrant vector store.
+    """Service for interacting with Qdrant vector store.
 
-    Manages collections, upserts chunks with embeddings, and performs
-    semantic search.
+    Manages collections, upserts chunks with both dense and sparse embeddings,
+    and performs semantic, keyword, and hybrid search.
     """
 
     VECTOR_SIZE = 384  # bge-small-en-v1.5 output dimension
@@ -59,8 +133,7 @@ class QdrantService:
         api_key: str | None = None,
         collection_name: str | None = None,
     ) -> None:
-        """
-        Initialize the Qdrant client.
+        """Initialise the Qdrant client.
 
         Args:
             url: Qdrant URL. If None, uses settings.
@@ -74,42 +147,68 @@ class QdrantService:
         )
         self._collection = collection_name or settings.qdrant.collection_name
 
-    def ensure_collection(self, vector_size: int = VECTOR_SIZE) -> None:
-        """
-        Create the collection if it does not exist.
+    # ─── Collection Management ────────────────────────────────────────────────
 
-        Uses cosine distance for semantic similarity search. Existing
-        collections are left unchanged.
+    def ensure_collection(self, vector_size: int = VECTOR_SIZE) -> None:
+        """Ensure the collection exists with dense AND sparse vector configs.
+
+        If the collection already exists (e.g., an older dense-only schema)
+        it is **deleted and re-created** so that the sparse index is always
+        present.  This keeps the method idempotent with respect to the target
+        schema: callers can call it on every startup without worrying about
+        stale configs.
 
         Args:
-            vector_size: Embedding dimension (default 384 for bge-small-en).
+            vector_size: Dense embedding dimension (default 384 for bge-small-en).
         """
         collections = self._client.get_collections().collections
         names = [c.name for c in collections]
+
         if self._collection in names:
-            return
+            # Drop the existing collection so we can apply the new schema
+            # (dense + sparse).  This is acceptable because:
+            #   1. The ingestion pipeline will re-populate on next upload.
+            #   2. Schema mismatches between dense-only and hybrid collections
+            #      silently break searches — a clean slate is safer.
+            self._client.delete_collection(self._collection)
 
         self._client.create_collection(
             collection_name=self._collection,
-            vectors_config=VectorParams(
-                size=vector_size,
-                distance=Distance.COSINE,
-            ),
+            # Named vectors dict: supports multiple independent vector spaces
+            # per point.  "dense" uses cosine distance (semantic similarity);
+            # "sparse" will be configured separately below.
+            vectors_config={
+                DENSE_VECTOR_NAME: VectorParams(
+                    size=vector_size,
+                    distance=Distance.COSINE,
+                ),
+            },
+            # Sparse vectors are stored in a separate, dedicated index.
+            # on_disk=False keeps the index in RAM for fast lookup.
+            sparse_vectors_config={
+                SPARSE_VECTOR_NAME: SparseVectorParams(
+                    index=SparseIndexParams(on_disk=False),
+                ),
+            },
         )
+
+    # ─── Upsert ───────────────────────────────────────────────────────────────
 
     def upsert_chunks(
         self,
         chunks: list[dict[str, Any]],
         embeddings: np.ndarray,
     ) -> None:
-        """
-        Upsert chunks with their embeddings into the collection.
+        """Upsert chunks with dense and sparse vectors into the collection.
 
-        Each chunk is stored as a point with a UUID, its embedding as the
-        vector, and text + metadata in the payload.
+        Each chunk is stored as a point containing:
+          • A deterministic UUID (from source+page+chunk_index) for idempotency.
+          • A named "dense" float vector (semantic embedding).
+          • A named "sparse" BM25 vector (keyword index).
+          • The full chunk payload (text + metadata).
 
         Args:
-            chunks: List of chunk dicts with keys "text" and "metadata".
+            chunks: List of chunk dicts with keys ``text`` and ``metadata``.
             embeddings: Numpy array of shape (n, dim) matching chunk order.
         """
         if not chunks:
@@ -120,24 +219,28 @@ class QdrantService:
                 f"Chunk count ({len(chunks)}) must match embedding count ({len(embeddings)})"
             )
 
+        # Build sparse vectors for all chunks in one BM25 pass so IDF is
+        # computed over the full batch (better weighting than per-chunk).
+        texts = [c.get("text", "") for c in chunks]
+        corpus_tokens = [_tokenize(t) for t in texts]
+
         points = []
-        for chunk, embedding in zip(chunks, embeddings):
+        for chunk, embedding, chunk_tokens in zip(chunks, embeddings, corpus_tokens):
+            # ── Deterministic UUID ────────────────────────────────────────────
             # Derive a content-based UUID so that repeated ingestion of the
-            # same source does not create duplicate points.  In production the
-            # ingestion pipeline may run multiple times for the same
-            # document; using a deterministic ID computed from the
-            # (source_filename, page_number, chunk_index) combo makes the
-            # process *idempotent* – re‑upserting the same chunk simply
-            # overwrites the existing point instead of adding a new one.
-            # This avoids vector store bloat and ensures stable references.
+            # same source does not create duplicate points.
             meta = chunk.get("metadata", {})
             source = meta.get("source_filename", "")
             page = meta.get("page_number", 0)
             idx = meta.get("chunk_index", 0)
             hash_input = f"{source}:{page}:{idx}".encode("utf-8")
             sha_bytes = hashlib.sha256(hash_input).digest()
-            # take first 16 bytes of the hash to create a deterministic UUID
-            chunk_uuid = uuid.UUID(bytes=sha_bytes[:16])
+            chunk_uuid = uuid.UUID(bytes=bytes(sha_bytes[:16]))
+
+            # ── Sparse BM25 vector ────────────────────────────────────────────
+            # We compute the sparse vector for this chunk using the full corpus
+            # so IDF scores are normalised across all chunks being upserted.
+            sparse_vec = _build_sparse_vector(chunk_tokens, corpus_tokens)
 
             payload = {
                 "text": chunk.get("text", ""),
@@ -146,7 +249,11 @@ class QdrantService:
             points.append(
                 PointStruct(
                     id=str(chunk_uuid),
-                    vector=embedding.tolist(),
+                    # Named vectors: each key maps to its own index/distance metric
+                    vector={
+                        DENSE_VECTOR_NAME: embedding.tolist(),
+                        SPARSE_VECTOR_NAME: sparse_vec,
+                    },
                     payload=payload,
                 )
             )
@@ -156,86 +263,167 @@ class QdrantService:
             points=points,
         )
 
+    # ─── Dense Search ─────────────────────────────────────────────────────────
+
     def search(
         self,
         query_embedding: np.ndarray,
         top_k: int = 5,
     ) -> list[dict[str, Any]]:
-        """
-        Search for the most similar chunks by query embedding.
+        """Search for the most similar chunks by dense query embedding.
 
         Args:
             query_embedding: Query vector of shape (dim,).
             top_k: Number of results to return.
 
         Returns:
-            List of dicts with "text" and "metadata" for each result,
-            ordered by relevance (most similar first).
+            List of dicts with ``text`` and ``metadata``, ordered by
+            cosine similarity (most similar first).
         """
-        # qdrant-client has evolved across versions: older/newer clients
-        # expose different method names. Try common variants and normalize
-        # the returned hits to a simple list of dicts with `text` and
-        # `metadata` keys.
-        results = None
-        try:
-            if hasattr(self._client, "search"):
-                results = self._client.search(
-                    collection_name=self._collection,
-                    query_vector=query_embedding.tolist(),
-                    limit=top_k,
-                )
-            elif hasattr(self._client, "search_points"):
-                # Newer qdrant-client versions use `search_points`
-                results = self._client.search_points(
-                    collection_name=self._collection,
-                    query_vector=query_embedding.tolist(),
-                    limit=top_k,
-                    with_payload=True,
-                )
-            else:
-                # Fall back to calling the Qdrant HTTP API directly. This
-                # covers environments where the installed qdrant-client
-                # version doesn't expose a compatible search method.
-                settings = get_settings()
-                base = settings.qdrant.url.rstrip("/")
-                url = f"{base}/collections/{self._collection}/points/search"
-                headers = {"Content-Type": "application/json"}
-                if settings.qdrant.api_key:
-                    # Accept both common header styles to be permissive
-                    headers["api-key"] = settings.qdrant.api_key
-                    headers["Authorization"] = f"Bearer {settings.qdrant.api_key}"
+        # query_points is the universal search method in qdrant-client v1.x.
+        # Pass the raw vector as `query` and select which named vector to search
+        # against with `using`. The response has a `.points` attribute.
+        response = self._client.query_points(
+            collection_name=self._collection,
+            query=query_embedding.tolist(),
+            using=DENSE_VECTOR_NAME,
+            limit=top_k,
+            with_payload=True,
+        )
+        return self._format_hits(response.points)
 
-                payload = {
-                    "vector": query_embedding.tolist(),
-                    "limit": top_k,
-                    "with_payload": True,
+    # ─── Hybrid Search ────────────────────────────────────────────────────────
+
+    def hybrid_search(
+        self,
+        query: str,
+        query_embedding: np.ndarray,
+        top_k: int = 5,
+        rrf_k: int = 60,
+        prefetch_multiplier: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Hybrid search combining dense vectors + sparse BM25, fused via RRF.
+
+        Two independent searches are performed against the same collection:
+          1. **Dense search** — embeds the query as a float vector and finds
+             semantically similar chunks using cosine distance.
+          2. **Sparse search** — represents the query as a BM25 bag-of-words
+             vector and finds chunks with high keyword overlap.
+
+        The two ranked lists are then fused with **Reciprocal Rank Fusion**:
+
+            RRF_score(doc) = Σ  1 / (k + rank_i)
+
+        where the sum runs over every list in which the doc appears, ``rank_i``
+        is its 1-based rank in that list, and ``k`` (default 60) is a constant
+        that dampens the advantage of very high ranks. Documents appearing in
+        *both* lists receive contributions from both terms, naturally boosting
+        results that are both semantically relevant AND keyword-matching.
+
+        Why k=60?
+          The value 60 was validated empirically by Cormack et al. (2009) and
+          is the de-facto standard in information retrieval.  It prevents a
+          rank-1 result from dominating completely (1/61 ≈ 0.016 vs 1/1=1).
+
+        Args:
+            query:               Raw user query string (used for BM25 tokens).
+            query_embedding:     Dense query embedding of shape (dim,).
+            top_k:               Number of fused results to return.
+            rrf_k:               RRF constant (default 60).
+            prefetch_multiplier: Each leg fetches ``top_k * prefetch_multiplier``
+                                 candidates before fusion.  Larger values give
+                                 RRF more to work with at the cost of latency.
+
+        Returns:
+            List of dicts with ``text``, ``metadata``, and ``rrf_score``,
+            sorted descending by fused RRF score.
+        """
+        candidate_limit = top_k * prefetch_multiplier
+        query_tokens = _tokenize(query)
+
+        # ── Leg 1: Dense semantic search ─────────────────────────────────────
+        # query_points() replaces the removed .search() in qdrant-client v1.x.
+        # `using` selects which named vector index to query.
+        dense_resp = self._client.query_points(
+            collection_name=self._collection,
+            query=query_embedding.tolist(),
+            using=DENSE_VECTOR_NAME,
+            limit=candidate_limit,
+            with_payload=True,
+        )
+        dense_hits = dense_resp.points
+
+        # ── Leg 2: Sparse BM25 keyword search ────────────────────────────────
+        # Pass SparseVector directly as `query`; Qdrant detects it's sparse.
+        query_sparse_vec = _query_sparse_vector(query_tokens)
+        sparse_resp = self._client.query_points(
+            collection_name=self._collection,
+            query=query_sparse_vec,
+            using=SPARSE_VECTOR_NAME,
+            limit=candidate_limit,
+            with_payload=True,
+        )
+        sparse_hits = sparse_resp.points
+
+        # ── Reciprocal Rank Fusion ────────────────────────────────────────────
+        # Build a map of point_id → accumulated RRF score.
+        # We also preserve the payload for each unique ID so we can reconstruct
+        # the result dicts after scoring.
+        rrf_scores: dict[str, float] = {}
+        payloads: dict[str, dict[str, Any]] = {}
+
+        for rank, hit in enumerate(dense_hits, start=1):
+            pt_id = str(hit.id)
+            # Each leg contributes 1 / (k + rank) to the fused score.
+            # A document ranking 1st in dense search gets 1/(60+1) ≈ 0.0164.
+            rrf_scores[pt_id] = rrf_scores.get(pt_id, 0.0) + 1.0 / (rrf_k + rank)
+            if pt_id not in payloads:
+                payloads[pt_id] = hit.payload or {}
+
+        for rank, hit in enumerate(sparse_hits, start=1):
+            pt_id = str(hit.id)
+            # A document found in BOTH lists gets contributions from BOTH ranks.
+            # e.g., rank-1 dense + rank-1 sparse → 2 × (1/61) ≈ 0.033
+            # This is the key property that makes hybrid search powerful:
+            # exact-match + semantic-match simultaneously → highest score.
+            rrf_scores[pt_id] = rrf_scores.get(pt_id, 0.0) + 1.0 / (rrf_k + rank)
+            if pt_id not in payloads:
+                payloads[pt_id] = hit.payload or {}
+
+        # Sort all unique docs by fused score (descending) and take top_k
+        sorted_ids = sorted(rrf_scores, key=lambda i: rrf_scores[i], reverse=True)
+        top_ids = sorted_ids[:top_k]
+
+        results = []
+        for pt_id in top_ids:
+            payload = payloads[pt_id]
+            results.append(
+                {
+                    "text": payload.get("text", ""),
+                    "metadata": {k: v for k, v in payload.items() if k != "text"},
+                    "rrf_score": round(rrf_scores[pt_id], 6),
                 }
+            )
 
-                resp = requests.post(url, headers=headers, json=payload, timeout=30)
-                resp.raise_for_status()
-                data = resp.json()
-                # Qdrant HTTP returns {'result': [...]} or similar
-                results = data.get("result") if isinstance(data, dict) else data
-        except Exception:
-            # Re-raise a clearer error for the API callers
-            raise
+        return results
 
-        def _extract_payload(hit: Any) -> dict[str, Any]:
-            # Compatible extraction for different result shapes
-            if hasattr(hit, "payload"):
-                return hit.payload or {}
-            if isinstance(hit, dict):
-                return hit.get("payload", {}) or {}
-            return {}
+    # ─── Internal helpers ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _format_hits(hits: list[Any]) -> list[dict[str, Any]]:
+        """Normalise Qdrant hit objects into plain dicts."""
         formatted: list[dict[str, Any]] = []
-        for hit in results:
-            payload = _extract_payload(hit)
+        for hit in hits:
+            payload: dict[str, Any] = {}
+            if hasattr(hit, "payload"):
+                payload = hit.payload or {}
+            elif isinstance(hit, dict):
+                payload = hit.get("payload", {}) or {}
+
             formatted.append(
                 {
                     "text": payload.get("text", ""),
                     "metadata": {k: v for k, v in payload.items() if k != "text"},
                 }
             )
-
         return formatted

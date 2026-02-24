@@ -48,7 +48,7 @@ class EmbeddingService:
         name = model_name or settings.huggingface.embedding_model
         self._model = SentenceTransformer(name)
 
-    def embed_chunks(self, texts: list[str]) -> np.ndarray:
+    def  embed_chunks(self, texts: list[str]) -> np.ndarray:
         """
         Embed a list of chunk texts.
 
