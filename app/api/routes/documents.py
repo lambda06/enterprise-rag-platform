@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, Body, File, HTTPException, Query, UploadFile
 
 from app.ingestion.pipeline import ingest
+from app.rag.pipeline import rag_pipeline
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -92,8 +93,6 @@ async def chat(
             status_code=400,
             detail="Request body must include a 'question' string",
         )
-
-    from app.rag.pipeline import rag_pipeline
 
     try:
         result = await rag_pipeline.query(q, evaluate=evaluate)

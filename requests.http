@@ -64,7 +64,7 @@ POST {{baseUrl}}/api/v1/documents/chat
 Content-Type: application/json
 
 {
-  "question": "what is this document about?"
+  "question": "How do RAG-Token and RAG-Sequence differ?"
 }
 
 ###

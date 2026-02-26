@@ -27,6 +27,7 @@ sentence-transformers==2.2.2
 transformers==4.35.0
 rank-bm25==0.2.2
 ragas==0.2.15
+langfuse>=2.0.0,<3.0.0
 
 # =============================================================================
 # Vector Database & Data
