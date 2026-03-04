@@ -58,6 +58,7 @@ class QdrantSettings(BaseSettings):
     url: str = Field(default="http://localhost:6333", description="Qdrant instance URL")
     api_key: Optional[str] = Field(default=None, description="API key (required for Qdrant Cloud)")
     collection_name: str = Field(default="documents", description="Default collection name")
+    timeout: float = Field(default=60.0, description="Timeout for Qdrant operations in seconds")
 
 
 class PostgresSettings(BaseSettings):

@@ -144,6 +144,7 @@ class QdrantService:
         self._client = QdrantClient(
             url=url or settings.qdrant.url,
             api_key=api_key or settings.qdrant.api_key,
+            timeout=settings.qdrant.timeout,
         )
         self._collection = collection_name or settings.qdrant.collection_name
 

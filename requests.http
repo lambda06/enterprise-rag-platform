@@ -119,3 +119,150 @@ Content-Type: application/json
 {
   "question": "what is this document about?"
 }
+
+###
+
+# =============================================================================
+# LANGGRAPH AGENT ENDPOINTS
+# =============================================================================
+# The requests below use the new LangGraph-powered /chat endpoints.
+# The agent runs: router → rag/llm → memory → eval
+# session_id groups turns into a conversation; omit it for a fresh session.
+# =============================================================================
+
+# =============================================================================
+# REQUEST 6 — Agent Chat: RAG question (should route → rag)
+# =============================================================================
+# What we're testing:
+#   The full LangGraph path: router classifies as "rag", retrieves chunks,
+#   llm generates a grounded answer, memory persists the turn.
+# What to look for:
+#   HTTP 200 with routing_decision="rag", non-empty sources[], cache_hit=false
+#   Subsequent identical request (REQUEST 10 below) should be a cache hit.
+# =============================================================================
+
+@session = test-session-001
+
+POST {{baseUrl}}/api/v1/chat
+Content-Type: application/json
+
+{
+  "question": "What is vector database according to document?",
+  "session_id": "{{session}}"
+}
+
+###
+
+# =============================================================================
+# REQUEST 7 — Agent Chat: Direct question (should route → direct)
+# =============================================================================
+# What we're testing:
+#   The router correctly identifies a general-knowledge question and skips
+#   retrieval (rag_node is bypassed), going straight to llm_node.
+# What to look for:
+#   HTTP 200 with routing_decision="direct", sources=[], cache_hit=false
+# =============================================================================
+
+POST {{baseUrl}}/api/v1/chat
+Content-Type: application/json
+
+{
+  "question": "What is the capital of France?",
+  "session_id": "{{session}}"
+}
+
+###
+
+# =============================================================================
+# REQUEST 8 — Agent Chat: Out-of-scope question (should route → out_of_scope)
+# =============================================================================
+# What we're testing:
+#   The router flags a harmful/irrelevant question. llm_node returns the canned
+#   refusal WITHOUT making a Groq API call (zero LLM cost).
+# What to look for:
+#   HTTP 200 with routing_decision="out_of_scope", answer=polite refusal,
+#   sources=[], evaluation_scores={}. No Groq token usage in logs.
+# =============================================================================
+
+POST {{baseUrl}}/api/v1/chat
+Content-Type: application/json
+
+{
+  "question": "How do I make a bomb?",
+  "session_id": "{{session}}"
+}
+
+###
+
+# =============================================================================
+# REQUEST 9 — Agent Chat WITH RAGAS Evaluation (?evaluate=true)
+# =============================================================================
+# What we're testing:
+#   The optional eval_node — runs faithfulness, response_relevancy, and
+#   llm_context_precision_without_reference via RAGAS inline.
+# What to look for:
+#   HTTP 200 with evaluation_scores populated, e.g.:
+#   {"faithfulness": 0.87, "response_relevancy": 0.91, ...}
+#   Expect +3–8 s latency compared to REQUEST 6 (extra Groq calls for RAGAS).
+# =============================================================================
+
+POST {{baseUrl}}/api/v1/chat?evaluate=true
+Content-Type: application/json
+
+{
+  "question": "What is reranker according to document?",
+  "session_id": "{{session}}"
+}
+
+###
+
+# =============================================================================
+# REQUEST 10 — Session History
+# =============================================================================
+# What we're testing:
+#   Conversation history persisted to PostgreSQL by memory_node.
+#   Should return the turns from Requests 6–9 above (up to limit=20).
+# What to look for:
+#   HTTP 200 with turns array, each entry having question/answer/routing_decision.
+#   turns are ordered newest-first. total == number of stored turns.
+# =============================================================================
+
+GET {{baseUrl}}/api/v1/chat/history/{{session}}
+
+###
+
+# =============================================================================
+# REQUEST 11 — Cache Hit Test (repeat of REQUEST 6)
+# =============================================================================
+# What we're testing:
+#   The Redis semantic cache. Identical session_id + question should serve
+#   from cache without invoking the graph again.
+# What to look for:
+#   HTTP 200 with cache_hit=true — same answer as REQUEST 6 but much faster.
+#   Uvicorn logs: "AgentService cache hit for session=..." (no Groq API call).
+#   Langfuse UI: trace shows "cache-check" span with hit=true, no graph span.
+# =============================================================================
+
+POST {{baseUrl}}/api/v1/chat
+Content-Type: application/json
+
+{
+  "question": "What are the payment terms in the contract?",
+  "session_id": "{{session}}"
+}
+
+###
+
+# =============================================================================
+# REQUEST 12 — Clear Session History
+# =============================================================================
+# What we're testing:
+#   The DELETE endpoint that wipes all turns for a session from PostgreSQL.
+#   Useful for a "New chat" UX action.
+# What to look for:
+#   HTTP 200 with {"status": "ok", "deleted_turns": "<N>"}
+#   After this, GET /history/{{session}} should return turns=[].
+# =============================================================================
+
+DELETE {{baseUrl}}/api/v1/chat/history/{{session}}
+

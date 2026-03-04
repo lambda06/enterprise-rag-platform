@@ -94,8 +94,6 @@ def _run_ragas(
 
     evaluator_llm = _build_evaluator_llm()
 
-    # SingleTurnSample holds exactly one question/answer/context triple.
-    # EvaluationDataset wraps one or more samples for the evaluate() call.
     sample = SingleTurnSample(
         user_input=question,
         response=answer,
@@ -109,7 +107,10 @@ def _run_ragas(
         LLMContextPrecisionWithoutReference(),
     ]
 
-    evaluator_embeddings = _build_evaluator_embeddings()
+    from langchain_core.callbacks import BaseCallbackHandler
+    
+    class SilentCallbackHandler(BaseCallbackHandler):
+        pass
 
     result = evaluate(
         dataset=dataset,
@@ -120,6 +121,7 @@ def _run_ragas(
         embeddings=evaluator_embeddings,
         # raise_exceptions=False keeps RAGAS from crashing on partial failures
         raise_exceptions=False,
+        callbacks=[SilentCallbackHandler()],
     )
 
     # EvaluationResult in RAGAS 0.2 supports subscript access, not .get().
