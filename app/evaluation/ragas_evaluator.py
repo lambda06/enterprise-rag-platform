@@ -18,6 +18,12 @@ returned as ``{"error": "..."}`` so the pipeline never fails.
 
 from __future__ import annotations
 
+# !! Must be set BEFORE any langchain/ragas imports !!
+# LangGraph injects LangSmith callbacks into all nodes; disable entirely
+# since we use Langfuse for tracing instead.
+import os
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
+
 import asyncio
 import logging
 from typing import Any
@@ -93,6 +99,7 @@ def _run_ragas(
     )
 
     evaluator_llm = _build_evaluator_llm()
+    evaluator_embeddings = _build_evaluator_embeddings()
 
     sample = SingleTurnSample(
         user_input=question,

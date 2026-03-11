@@ -64,7 +64,7 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
             pass
 
 
-@router.post("/query")
+@router.post("/chat")
 async def query(
     question: dict = Body(...),
     evaluate: bool = Query(

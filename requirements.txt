@@ -2,67 +2,68 @@
 # Enterprise RAG Platform - Python Dependencies
 # =============================================================================
 # Last updated: February 22, 2026
-# Python: 3.11+
+# Python: 3.12.x
 
 # =============================================================================
 # Web Framework & HTTP
 # =============================================================================
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-starlette==0.27.0
-pydantic-settings>=2.1.0
-python-multipart==0.0.6
-httpx==0.25.1
-requests==2.31.0
+fastapi>=0.104.0,<0.116.0
+uvicorn[standard]>=0.24.0,<0.33.0
+starlette>=0.37.2,<0.39.0
+pydantic-settings>=2.4.0
+python-multipart==0.0.6,<0.1.0
+httpx>=0.25.0,<0.30.0
+requests>=2.31.0,<2.33.0
 
 # =============================================================================
 # LLM & Language Processing
 # =============================================================================
 groq>=0.4.2,<1.0.0
-langchain>=0.3.0,<0.4.0
-langchain-core>=0.3.33,<0.4.0
-langchain-community>=0.3.0,<0.4.0
-langchain-text-splitters>=0.3.0,<0.4.0
-langchain-groq>=0.2.0,<0.3.0
-torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-sentence-transformers>=2.2.2
-transformers>=4.35.0
+langchain>=0.3.5,<0.4.0
+langchain-core>=0.3.50,<0.4.0
+langchain-community>=0.3.5,<0.4.0
+langchain-text-splitters>=0.3.2,<0.4.0
+langchain-groq>=0.2.2,<0.3.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.6.0,<3.0.0
+sentence-transformers>=2.8.0
+transformers>=4.45.0
 rank-bm25>=0.2.2
-ragas
-langfuse>=2.0.0,<3.0.0
-langgraph>=0.2.0,<0.3.0
-pydantic>=2.7.4,<3.0.0
+ragas>=0.3.0
+langfuse>=2.40.0,<3.0.0
+langgraph>=0.2.45,<0.3.0
+pydantic>=2.8.0,<3.0.0
 
 # =============================================================================
 # Vector Database & Data
 # =============================================================================
-qdrant-client==1.17.0
-numpy==1.24.3
-python-dotenv==1.0.0
+qdrant-client>=1.14.0,<2.0.0
+numpy>=2.0.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
 
 # =============================================================================
 # Database
 # =============================================================================
-asyncpg==0.29.0
-sqlalchemy==2.0.23
-alembic==1.12.1
+asyncpg>=0.30.0,<0.31.0
+sqlalchemy>=2.0.25,<2.1.0
+alembic>=1.14.0,<2.0.0
 
 # =============================================================================
 # Caching
 # =============================================================================
-redis==5.0.1
+redis>=5.0.7,<6.0.0
 
 # =============================================================================
 # Document Processing
 # =============================================================================
-pymupdf==1.23.4
+pymupdf>=1.24.0,<1.25.0
 
 # =============================================================================
 # Development & Testing
 # =============================================================================
-pytest==7.4.3
-pytest-asyncio==0.21.1
-black==23.12.0
-ruff==0.1.8
-mypy==1.7.0
-typing-extensions>=4.10.0,<5.0.0
+pytest>=8.0.0,<9.0.0
+pytest-asyncio>=0.24.0,<0.25.0
+black>=24.10.0,<25.0.0
+ruff>=0.8.0,<0.9.0
+mypy>=1.14.0,<2.0.0
+typing-extensions>=4.12.0,<5.0.0
