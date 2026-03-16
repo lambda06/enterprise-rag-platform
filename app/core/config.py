@@ -31,6 +31,31 @@ class AppSettings(BaseSettings):
     debug: bool = Field(default=False, description="Enable debug mode")
 
 
+class GeminiSettings(BaseSettings):
+    """Google Gemini API configuration (embeddings + generation)."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="GEMINI_",
+        env_file=_PROJECT_ROOT / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    api_key: str = Field(default="", description="Gemini API key")
+    embedding_model: str = Field(
+        default="gemini-embedding-2-preview",
+        description="Gemini embedding model ID",
+    )
+    embedding_dimensions: int = Field(
+        default=768,
+        description="Output dimensionality (MRL sub-3072; requires manual L2 norm)",
+    )
+    generation_model: str = Field(
+        default="gemini-2.5-flash",
+        description="Gemini generation model ID (text + multimodal)",
+    )
+
+
 class GroqSettings(BaseSettings):
     """Groq LLM API configuration."""
 
@@ -59,6 +84,11 @@ class QdrantSettings(BaseSettings):
     api_key: Optional[str] = Field(default=None, description="API key (required for Qdrant Cloud)")
     collection_name: str = Field(default="documents", description="Default collection name")
     timeout: float = Field(default=60.0, description="Timeout for Qdrant operations in seconds")
+    # 768 = gemini-embedding-2-preview output dimension when using
+    # output_dimensionality=768 with manual L2 normalisation (sub-3072).
+    # Changed from 384 (BAAI/bge-small-en-v1.5) as part of the multimodal
+    # embedding migration on 2026-03-10.  Override via QDRANT_VECTOR_SIZE env var.
+    vector_size: int = Field(default=768, description="Dense vector dimension (gemini-embedding-2-preview)")
 
 
 class PostgresSettings(BaseSettings):
@@ -116,10 +146,6 @@ class HuggingFaceSettings(BaseSettings):
     )
 
     token: str = Field(default="", validation_alias="HUGGINGFACE_TOKEN")
-    embedding_model: str = Field(
-        default="BAAI/bge-small-en-v1.5",
-        validation_alias="EMBEDDING_MODEL",
-    )
     reranker_model: str = Field(
         default="cross-encoder/ms-marco-MiniLM-L-6-v2",
         validation_alias="RERANKER_MODEL",
@@ -136,12 +162,20 @@ class Settings(BaseSettings):
     )
 
     app: AppSettings = Field(default_factory=AppSettings)
+    gemini: GeminiSettings = Field(default_factory=GeminiSettings)
     groq: GroqSettings = Field(default_factory=GroqSettings)
     qdrant: QdrantSettings = Field(default_factory=QdrantSettings)
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)
     huggingface: HuggingFaceSettings = Field(default_factory=HuggingFaceSettings)
+
+    # LLM provider selection — set LLM_PROVIDER=groq to use Groq as fallback
+    llm_provider: str = Field(
+        default="gemini",
+        validation_alias="LLM_PROVIDER",
+        description="Active LLM provider: 'gemini' (default) or 'groq' (fallback)",
+    )
 
 
 @lru_cache

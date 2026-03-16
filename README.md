@@ -13,8 +13,8 @@ The most interesting part of this project? **The system decides how to answer �
 | Layer | Technology |
 |---|---|
 | **API** | FastAPI · Uvicorn · Pydantic v2 |
-| **LLM** | Groq (LLaMA 3.3 70B) · LangChain · LangGraph |
-| **Embeddings / Reranking** | HuggingFace · `BAAI/bge-small-en-v1.5` · `ms-marco-MiniLM-L-6-v2` |
+| **LLM** | Gemini 2.0 Flash (Multimodal) · Groq (Fallback) · LangChain · LangGraph |
+| **Embeddings / Reranking** | `gemini-embedding-2-preview` · `ms-marco-MiniLM-L-6-v2` |
 | **Vector Store** | Qdrant (dense + sparse hybrid) |
 | **Evaluation** | RAGAS (reference-free metrics) |
 | **Observability** | Langfuse (tracing · spans · prompt versioning) |
@@ -30,7 +30,7 @@ The most interesting part of this project? **The system decides how to answer �
 Phase 1 ✅  RAG Core         — PDF ingestion · vector search · FastAPI backend
 Phase 2 ✅  Optimization     — Hybrid search · Cross-encoder reranking · RAGAS evaluation
 Phase 3 ✅  Agentic Layer    — LangGraph agent · Intelligent routing · Conversation memory
-Phase 4 🔜  Multimodal       — Images · Tables · Fine-tuned reranker
+Phase 4 ✅  Multimodal       — Images · Tables · Gemini 2.0 Flash
 Phase 5 🔜  MLOps            — Langfuse observability · Prompt versioning (groundwork laid)
 Phase 6 🔜  Deployment       — Docker · CI/CD · Live on cloud
 ```
@@ -91,12 +91,7 @@ Phase 6 🔜  Deployment       — Docker · CI/CD · Live on cloud
 - **Cause:** `CrossEncoder(_RERANKER_MODEL)` raised a network error when HuggingFace Hub was behind a firewall or hadn't been pre-cached, preventing the server from starting.
 - **Fix:** Wrapped the model load in a `try/except`. On failure, `_reranker` is set to `None`. `_rerank()` detects `None` and falls back to returning the top-k results by hybrid-search RRF order. Server always starts; reranking degrades gracefully.
 
-**Issue 4: RAGAS `IndexError: list index out of range` when reading evaluation scores**
-- **Where:** `app/evaluation/ragas_evaluator.py` — `_run_ragas()`
-- **Cause:** RAGAS 0.2's `evaluate()` returns an `EvaluationResult` that supports subscript access (`result[metric_name]`) returning a list of scores — one per sample. The earlier code used direct `result.scores[0][key]` which hit an `IndexError` when LangSmith tracing callbacks interfered with the result structure.
-- **Fix:** Replaced the access pattern with a safe loop: `values = result[key]` → `val = values[0] if values else None`, wrapped in `try/except (KeyError, IndexError, TypeError)`. Also added a `SilentCallbackHandler` passed to `evaluate(..., callbacks=[...])` to suppress LangSmith tracing side-effects that were corrupting the internal result state.
-
-**Issue 5: `ResponseRelevancy` returning `None` / not scoring**
+**Issue  4: `ResponseRelevancy` returning `None` / not scoring**
 - **Where:** `app/evaluation/ragas_evaluator.py` — `_run_ragas()`
 - **Cause:** `ResponseRelevancy` requires an embedding model to measure cosine similarity between question and generated answer statements. When no `embeddings=` argument was passed to `evaluate()`, it silently returned `null` for that metric.
 - **Fix:** Built a `LangchainEmbeddingsWrapper` around `HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")` and passed it as `embeddings=evaluator_embeddings` to the `evaluate()` call, reusing the already-cached local model.
@@ -155,13 +150,22 @@ Phase 6 🔜  Deployment       — Docker · CI/CD · Live on cloud
 
 ---
 
-## 🖼 Phase 4 — Multimodal *(planned)*
+## 🖼 Phase 4 — Multimodal ✅
 
-**Goal:** Extend ingestion to handle images and tables within PDFs. Fine-tune the reranker on domain-specific data.
+**Goal:** Extend ingestion to handle images and tables natively using Gemini multimodal models, and upgrade the LLM provider for unified cross-modal reasoning.
 
-- Table extraction and structured representation
-- Image captioning for visual content in documents
-- Domain-adapted cross-encoder reranker
+### What was built
+- **Unified Gemini Architecture** (`app/llm/gemini_client.py` & `app/rag/embeddings.py`) — Shifted from heterogeneous local/API models to a unified Google-GenAI stack. Replaced `BGE-small-en` with `gemini-embedding-2-preview` (multimodal, 768-dim MRL), and Groq with `gemini-2.0-flash` for generation. Groq is retained purely as a text-only fallback.
+- **Multimodal Embedding** (`app/ingestion/image_extractor.py`) — Extracts embedded PDF images via PyMuPDF (ignoring decorative elements < 100x100px) and embeds the PIL Image *directly* using Gemini. No intermediate captioning is done, reducing latency and preserving pixel detail. Image vectors exist in the same space as text queries.
+- **Vision at Query Time ("Option B")** (`app/ingestion/pipeline.py` & `app/rag/retrieval.py`) — Instead of static captions, raw `image_base64` strings are preserved in the Qdrant payload `metadata`. At query time, `retrieve_with_vision()` separates text chunks and image bytes.
+- **Single Multimodal RAG Payload** (`app/rag/pipeline.py`) — Passes both relevant text chunks and base64 images into a *single* `generate_multimodal_response` call. The Gemini LLM gets cross-attention over the whole context (prose + charts + question) simultaneously, yielding superior grounded answers.
+
+### 🐛 Issues Encountered & Resolutions
+
+**Issue 1: Cross-encoder dropping image chunks due to empty text**
+- **Where:** `app/rag/retrieval.py` — `retrieve_with_vision()`
+- **Cause:** Image points in Qdrant intentionally have `text=""` (BM25 sparse search relies on text, but images are retrieved via dense vector similarity). However, when the 2nd-stage cross-encoder attempted to score `(query, "")`, it generated near-zero scores, causing relevant images to be ranked out of the top-k and silently dropped before hitting the LLM.
+- **Fix:** Built a bypass array in `retrieve_with_vision()`. Image candidates are separated before reranking. Text chunks are reranked normally. Then, image candidates are force-merged back into the final result set up to the `top_k` capacity, guaranteeing they make it to the LLM.
 
 ---
 

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 """
-Groq LLM client using the official Groq Python SDK.
+Groq LLM client — FALLBACK provider.
+
+Use this when LLM_PROVIDER=groq is set in the environment.  The primary
+provider is GeminiLLMService (see app/llm/gemini_client.py), which re-uses
+the same google-generativeai SDK already used for embeddings and adds native
+multimodal support.  Groq is kept here as a lightweight text-only fallback
+(llama-3.3-70b-versatile) for situations where Gemini is unavailable.
 
 This module initializes the official `Groq` client and provides an
-async `GroqLLMService.generate` method which calls
+async `GroqLLMService.generate_text_response` method which calls
 `client.chat.completions.create()` under the hood. Blocking SDK calls
 are executed in a thread via `asyncio.to_thread` so the API can be used
 from FastAPI endpoints safely.
@@ -96,10 +102,33 @@ class GroqLLMService:
 
         return str(resp)
 
-    async def generate(self, query: str, context_chunks: Iterable[str]) -> str:
-        """Async wrapper that generates a grounded answer from context."""
+    async def generate_text_response(self, query: str, context_chunks: Iterable[str]) -> str:
+        """Async wrapper that generates a grounded answer from text context."""
         messages = self._build_messages(query, context_chunks)
         return await asyncio.to_thread(self._call_sync, messages)
+
+    # Backward-compatible alias
+    async def generate(self, query: str, context_chunks: Iterable[str]) -> str:
+        return await self.generate_text_response(query, context_chunks)
+
+    async def generate_multimodal_response(
+        self,
+        query: str,
+        context_chunks: Iterable[str],
+        image_b64_list: list[str],
+    ) -> str:
+        """Fallback: Groq is text-only so images are ignored.
+
+        Logs a warning so operators know image context is being dropped,
+        then delegates to the text-only path.
+        """
+        import logging
+        logging.getLogger(__name__).warning(
+            "GroqLLMService does not support image inputs — "
+            "%d image(s) will be ignored. Switch LLM_PROVIDER=gemini for vision.",
+            len(image_b64_list),
+        )
+        return await self.generate_text_response(query, context_chunks)
 
 
 # Module-level singleton

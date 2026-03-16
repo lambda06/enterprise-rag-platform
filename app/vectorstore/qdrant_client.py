@@ -3,6 +3,28 @@ Qdrant vector store client for the Enterprise RAG Platform.
 
 Handles collection management, chunk upserts, dense semantic search,
 and hybrid (dense + sparse BM25) search with Reciprocal Rank Fusion.
+
+─── Architectural Note: Embedding Dimension Change (384 → 768) ──────────────
+Previously this platform used BAAI/bge-small-en-v1.5 (sentence-transformers),
+a text-only model producing 384-dimensional vectors.  Multimodal support
+required three separate pipelines: bge-small-en for text, GPT-4o-mini vision
+API to caption images (then embed the captions as text), and markdown
+conversion for tables followed by text embedding.  This was complex, had
+multiple failure points, and still produced text-to-text retrieval of image
+descriptions rather than genuine cross-modal retrieval.
+
+On 2026-03-10 Google released `gemini-embedding-2-preview`, a fully multimodal
+embedding model that maps text, images, video, audio, and PDFs into a single
+unified 3072-dimensional embedding space.  When using output_dimensionality
+below 3072 (e.g., 768) L2 normalisation must be applied manually — the
+embedding service handles this.  This collapses the three-pipeline approach
+into one, eliminates the captioning latency/cost, and enables genuine
+cross-modal retrieval (text query → image chunk) without any intermediate step.
+
+Consequence: the Qdrant collection schema is INCOMPATIBLE with the old 384-dim
+vectors.  Use `QdrantService.reset_collection()` (or the reset_collection
+CLI/startup hook) to drop and recreate the collection before re-ingesting.
+─────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
@@ -28,7 +50,8 @@ from app.core.config import get_settings
 
 # ─── Vector name constants ────────────────────────────────────────────────────
 # Qdrant supports multiple named vectors per point. We use two:
-#   "dense"  — 384-dim float vector from BAAI/bge-small-en-v1.5 (cosine)
+#   "dense"  — 768-dim float vector from gemini-embedding-2-preview (cosine)
+#              (L2-normalised by the embedding service before storage)
 #   "sparse" — variable-length BM25 bag-of-words vector (dot product)
 DENSE_VECTOR_NAME = "dense"
 SPARSE_VECTOR_NAME = "sparse"
@@ -125,7 +148,7 @@ class QdrantService:
     and performs semantic, keyword, and hybrid search.
     """
 
-    VECTOR_SIZE = 384  # bge-small-en-v1.5 output dimension
+    VECTOR_SIZE = 768  # gemini-embedding-2-preview output dimension (L2-normalised sub-3072)
 
     def __init__(
         self,
@@ -150,7 +173,7 @@ class QdrantService:
 
     # ─── Collection Management ────────────────────────────────────────────────
 
-    def ensure_collection(self, vector_size: int = VECTOR_SIZE) -> None:
+    def ensure_collection(self, vector_size: int | None = None) -> None:
         """Ensure the collection exists with dense AND sparse vector configs.
 
         If the collection already exists (e.g., an older dense-only schema)
@@ -160,8 +183,13 @@ class QdrantService:
         stale configs.
 
         Args:
-            vector_size: Dense embedding dimension (default 384 for bge-small-en).
+            vector_size: Dense embedding dimension.  Defaults to
+                ``settings.qdrant.vector_size`` (768 for
+                gemini-embedding-2-preview with L2 normalisation).
         """
+        if vector_size is None:
+            vector_size = get_settings().qdrant.vector_size
+
         collections = self._client.get_collections().collections
         names = [c.name for c in collections]
 
@@ -230,11 +258,16 @@ class QdrantService:
             # ── Deterministic UUID ────────────────────────────────────────────
             # Derive a content-based UUID so that repeated ingestion of the
             # same source does not create duplicate points.
+            # Fix: In a multimodal pipeline, a text chunk, an image, and a table
+            # on the same page might all have an index of 0. If we only hash
+            # source, page, and index, they will collide and overwrite each other.
+            # We fix this by including the content_type and the correct index key.
             meta = chunk.get("metadata", {})
             source = meta.get("source_filename", "")
             page = meta.get("page_number", 0)
-            idx = meta.get("chunk_index", 0)
-            hash_input = f"{source}:{page}:{idx}".encode("utf-8")
+            idx = meta.get("chunk_index", meta.get("image_index", meta.get("table_index", 0)))
+            content_type = meta.get("content_type", "text")
+            hash_input = f"{source}:{page}:{idx}:{content_type}".encode("utf-8")
             sha_bytes = hashlib.sha256(hash_input).digest()
             chunk_uuid = uuid.UUID(bytes=bytes(sha_bytes[:16]))
 

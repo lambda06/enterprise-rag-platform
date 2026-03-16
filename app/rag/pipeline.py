@@ -2,14 +2,30 @@
 RAG pipeline that combines retrieval and LLM generation.
 
 Provides `RAGPipeline` which uses the async `RetrievalService` to fetch
-relevant context chunks and the `GroqLLMService` to generate a grounded
-answer. The public `query` method is async and returns a dict with:
+relevant context chunks and the configured LLM service (Gemini 2.0 Flash by
+default, Groq as fallback) to generate a grounded answer.
 
-- `answer`:        LLM response string
-- `source_chunks`: list of retrieved chunks (each with `text` and `metadata`)
-- `chunk_count`:   number of returned chunks
-- `cache_hit`:     True if the response was served from Redis cache
-- `evaluation`:    RAGAS metric scores (only present when ``evaluate=True``)
+LLM selection
+-------------
+The active provider is read from ``LLM_PROVIDER`` env var via
+``app.llm.get_llm_service()``.  Default is ``"gemini"`` (Gemini 2.0 Flash).
+Set ``LLM_PROVIDER=groq`` to fall back to Groq (text-only).
+
+Vision at query time (Option B)
+--------------------------------
+When the query hits image chunks in Qdrant, ``RetrievalService.retrieve_with_vision``
+separates the base64 images from the text chunks.  The pipeline then calls
+``llm.generate_multimodal_response(question, contexts, images)`` — a single
+Gemini request with full cross-attention over all text AND images simultaneously.
+If no image chunks are retrieved, the cheaper text-only path is used.
+
+The public ``query`` method is async and returns a dict with:
+
+- ``answer``:        LLM response string
+- ``source_chunks``: list of retrieved chunks (each with ``text`` and ``metadata``)
+- ``chunk_count``:   number of returned chunks
+- ``cache_hit``:     True if the response was served from Redis cache
+- ``evaluation``:    RAGAS metric scores (only present when ``evaluate=True``)
 
 Langfuse tracing
 ----------------
@@ -19,8 +35,8 @@ Every query creates a Langfuse trace with four child spans:
                          and top RRF scores before reranking.
 2. ``reranking``       — cross-encoder reranking; logs before/after chunk
                          ordering (source filenames + chunk indices).
-3. ``llm-generation``  — Groq completion; logs the full messages array as
-                         input and the generated answer as output.
+3. ``llm-generation``  — Gemini/Groq completion; logs the prompt type
+                         (text-only vs multimodal) and the generated answer.
 4. (optional) ``ragas-evaluation`` — logged as trace metadata, not a span,
                          so evaluation scores appear on the trace overview.
 
@@ -35,7 +51,7 @@ from typing import Any
 
 from app.cache.redis_client import cache_service, make_cache_key
 from app.core.config import get_settings
-from app.llm.groq_client import groq_client
+from app.llm import get_llm_service
 from app.observability.langfuse_tracer import tracer
 from app.rag.retrieval import retrieval_service
 
@@ -49,10 +65,13 @@ class RAGPipeline:
     chunks as context. This helps reduce hallucination risk and provides
     traceability for sourced answers.
 
+    When image chunks are retrieved, a single multimodal Gemini request is
+    built with all text contexts AND inline images so the model can reason
+    over them jointly.
+
     Optionally, pass ``evaluate=True`` to `query()` to append inline RAGAS
     evaluation scores to the response. Evaluation is opt-in because it
     incurs additional LLM calls (roughly doubling latency per request).
-    In production, prefer the offline batch evaluation script instead.
     """
 
     def __init__(
@@ -61,7 +80,8 @@ class RAGPipeline:
         llm=None,
     ) -> None:
         self._retrieval = retrieval or retrieval_service
-        self._llm = llm or groq_client
+        # Use injected LLM (useful for tests) or the configured factory default
+        self._llm = llm or get_llm_service()
 
     async def query(
         self,
@@ -75,7 +95,7 @@ class RAGPipeline:
         1. Cache lookup — return immediately on hit (no trace spans created).
         2. Hybrid search span — dense cosine + BM25, logs candidate pool.
         3. Reranking span — cross-encoder, logs before/after chunk ordering.
-        4. LLM generation span — Groq completion, logs full prompt + answer.
+        4. LLM generation span — Gemini multimodal or text-only completion.
         5. Cache write — store result for 1 hour.
         6. (Optional) RAGAS evaluation — results logged as trace metadata.
 
@@ -83,8 +103,7 @@ class RAGPipeline:
             user_question: The user's query string.
             top_k:         Number of final chunks to return (default 5).
             evaluate:      If True, run RAGAS evaluation and include scores
-                           under the ``"evaluation"`` key. Evaluation results
-                           are never cached. Default False.
+                           under the ``"evaluation"`` key. Default False.
 
         Returns:
             dict with keys: ``answer``, ``source_chunks``, ``chunk_count``,
@@ -105,6 +124,7 @@ class RAGPipeline:
                 return cached
 
         # ── Start Langfuse trace ──────────────────────────────────────────────
+        llm_model = settings.gemini.generation_model
         trace = tracer.start_trace(
             "rag-query",
             input={"question": user_question},
@@ -112,7 +132,7 @@ class RAGPipeline:
                 "collection": collection,
                 "top_k": top_k,
                 "evaluate": evaluate,
-                "model": settings.groq.model,
+                "model": llm_model,
             },
         )
 
@@ -123,15 +143,15 @@ class RAGPipeline:
             input={"query": user_question, "candidate_k": top_k * 4},
         )
 
-        candidates, source_chunks = await self._retrieval.retrieve_staged(
-            user_question, top_k
+        # retrieve_with_vision returns (candidates, reranked, image_b64_list)
+        candidates, source_chunks, image_b64_list = (
+            await self._retrieval.retrieve_with_vision(user_question, top_k)
         )
 
         tracer.end_span(
             search_span,
             output={
                 "candidate_count": len(candidates),
-                # Top 5 RRF scores give a quick signal of retrieval quality
                 "top_rrf_scores": [
                     round(float(c.get("rrf_score", 0)), 4)
                     for c in candidates[:5]
@@ -145,7 +165,6 @@ class RAGPipeline:
             "reranking",
             input={
                 "candidate_count": len(candidates),
-                # Ordered list of (source_file, chunk_index) before reranking
                 "before_order": [
                     {
                         "source": c.get("metadata", {}).get("source_filename", "?"),
@@ -161,33 +180,47 @@ class RAGPipeline:
             rerank_span,
             output={
                 "returned_count": len(source_chunks),
-                # Ordered list of (source_file, chunk_index) after reranking
+                "image_count": len(image_b64_list),
                 "after_order": [
                     {
                         "source": c.get("metadata", {}).get("source_filename", "?"),
                         "chunk": c.get("metadata", {}).get("chunk_index", "?"),
+                        "content_type": c.get("metadata", {}).get("content_type", "text"),
                     }
                     for c in source_chunks
                 ],
             },
         )
 
-        # Materialise contexts as a concrete list so it can be consumed twice
-        # (once for the LLM prompt, once optionally for RAGAS).
+        # Text context — for image chunks text is "" but metadata is still useful
         contexts: list[str] = [c.get("text", "") for c in source_chunks]
 
         # ── Span 3: LLM generation ────────────────────────────────────────────
-        messages = self._llm._build_messages(user_question, iter(contexts))
-
+        is_multimodal = len(image_b64_list) > 0
         gen_span = tracer.start_generation(
             trace,
             "llm-generation",
-            model=settings.groq.model,
-            model_parameters={"temperature": 0.0, "max_tokens": 512},
-            input=messages,
+            model=llm_model,
+            model_parameters={"temperature": 0.0, "max_output_tokens": 1024},
+            input={
+                "question": user_question,
+                "context_count": len(contexts),
+                "image_count": len(image_b64_list),
+                "mode": "multimodal" if is_multimodal else "text-only",
+            },
         )
 
-        answer = await asyncio.to_thread(self._llm._call_sync, messages)
+        if is_multimodal:
+            logger.info(
+                "Multimodal generation: %d text chunks + %d image(s)",
+                len(contexts),
+                len(image_b64_list),
+            )
+            answer = await self._llm.generate_multimodal_response(
+                user_question, contexts, image_b64_list
+            )
+        else:
+            answer = await self._llm.generate_text_response(user_question, contexts)
 
         tracer.end_span(gen_span, output=answer)
 
@@ -234,12 +267,10 @@ class RAGPipeline:
             output={"answer": answer, "chunk_count": len(source_chunks)},
             metadata={
                 "cache_hit": False,
+                "multimodal": is_multimodal,
                 "evaluation": evaluation_metadata,
             },
         )
-        # Flush immediately so the trace is visible in Langfuse right away.
-        # Without an explicit flush the SDK batches events and only sends them
-        # every few seconds — which gets cut short by uvicorn --reload cycles.
         tracer.flush()
 
         return result

@@ -230,6 +230,98 @@ class RetrievalService:
 
         return candidates, reranked
 
+    async def retrieve_with_vision(
+        self,
+        query: str,
+        top_k: int = 5,
+    ) -> tuple[list[dict], list[dict], list[str]]:
+        """Two-stage retrieval that separates image base64 for multimodal prompting.
+
+        Extends :meth:`retrieve_staged` with vision support for Option B:
+        image chunks have their ``image_base64`` extracted from metadata and
+        returned separately so the RAG pipeline can pass them to Gemini in a
+        single multimodal request.
+
+        Image chunks have ``text=""`` which gives the cross-encoder a near-zero
+        score.  To prevent images from being silently dropped, they are injected
+        back into the final result list (up to ``top_k``) after reranking —
+        scored with a ``"[image]"`` placeholder so the encoder doesn't crash.
+
+        Args:
+            query:  The user query string.
+            top_k:  Number of final results to return (default 5).
+
+        Returns:
+            Three-tuple ``(candidates, reranked, image_b64_list)`` where:
+            - ``candidates``:      raw hybrid-search hits (for Langfuse tracing).
+            - ``reranked``:        final chunks, ``image_base64`` stripped from
+                                   metadata (kept clean for the LLM context text).
+            - ``image_b64_list``:  ordered list of base64 PNG strings for every
+                                   image chunk in ``reranked``, passed directly
+                                   to ``generate_multimodal_response``.
+        """
+        candidate_k = top_k * RERANK_FACTOR
+
+        query_embedding: np.ndarray = await asyncio.to_thread(
+            self._embed.embed_query, query
+        )
+
+        candidates: list[dict] = await asyncio.to_thread(
+            self._qdrant.hybrid_search,
+            query,
+            query_embedding,
+            candidate_k,
+        )
+
+        # ── Separate image and text candidates before reranking ───────────────
+        # Image chunks have text="" so they would score near-zero in the
+        # cross-encoder and be dropped.  We pull them out, score text candidates
+        # normally, then force-merge images back into the final result.
+        text_candidates: list[dict] = []
+        image_candidates: list[dict] = []
+
+        for hit in candidates:
+            if hit.get("metadata", {}).get("content_type") == "image":
+                image_candidates.append(hit)
+            else:
+                text_candidates.append(hit)
+
+        # Rerank text candidates normally
+        reranked_text: list[dict] = await asyncio.to_thread(
+            _rerank, query, text_candidates, top_k
+        )
+
+        # Merge image candidates back — cap total at top_k
+        # Images come after text chunks so text context has priority.
+        remaining_slots = max(0, top_k - len(reranked_text))
+        merged_raw = reranked_text + image_candidates[:remaining_slots]
+
+        logger.debug(
+            "retrieve_with_vision: %d text chunks + %d image chunk(s) in final set",
+            len(reranked_text),
+            len(image_candidates[:remaining_slots]),
+        )
+
+        # ── Build final return structures ─────────────────────────────────────
+        reranked: list[dict] = []
+        image_b64_list: list[str] = []
+
+        for hit in merged_raw:
+            meta = dict(hit.get("metadata", {}))
+            # Extract image_base64 from metadata — do NOT send raw base64
+            # as part of the text context block (it would be enormous and
+            # meaningless to a text-only context display).
+            b64 = meta.pop("image_base64", "") or ""
+            if hit.get("metadata", {}).get("content_type") == "image" and b64:
+                image_b64_list.append(b64)
+
+            reranked.append({
+                "text": hit.get("text", ""),
+                "metadata": meta,
+            })
+
+        return candidates, reranked, image_b64_list
+
 
 # Module-level singleton
 _retrieval_service: RetrievalService | None = None

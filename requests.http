@@ -38,10 +38,10 @@ POST {{baseUrl}}/api/v1/documents/upload
 Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
 
 ------WebKitFormBoundary7MA4YWxkTrZu0gW
-Content-Disposition: form-data; name="file"; filename="sample.pdf"
+Content-Disposition: form-data; name="file"; filename="sample_multi.pdf"
 Content-Type: application/pdf
 
-< ./sample.pdf
+< ./sample_multi.pdf
 ------WebKitFormBoundary7MA4YWxkTrZu0gW--
 
 ###
@@ -64,7 +64,7 @@ POST {{baseUrl}}/api/v1/documents/chat
 Content-Type: application/json
 
 {
-  "question": "How do RAG-Token and RAG-Sequence differ?"
+  "question": "What is the exact title printed above the bars in the bar chart?"
 }
 
 ###
@@ -210,7 +210,7 @@ POST {{baseUrl}}/api/v1/chat?evaluate=true
 Content-Type: application/json
 
 {
-  "question": "What is reranker according to document?",
+  "question": "What is API based on the provided document?",
   "session_id": "{{session}}"
 }
 
