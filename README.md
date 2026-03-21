@@ -160,6 +160,19 @@ Phase 6 🔜  Deployment       — Docker · CI/CD · Live on cloud
 - **Vision at Query Time ("Option B")** (`app/ingestion/pipeline.py` & `app/rag/retrieval.py`) — Instead of static captions, raw `image_base64` strings are preserved in the Qdrant payload `metadata`. At query time, `retrieve_with_vision()` separates text chunks and image bytes.
 - **Single Multimodal RAG Payload** (`app/rag/pipeline.py`) — Passes both relevant text chunks and base64 images into a *single* `generate_multimodal_response` call. The Gemini LLM gets cross-attention over the whole context (prose + charts + question) simultaneously, yielding superior grounded answers.
 
+### Known Limitation: Multimodal Evaluation
+
+RAGAS is a text-only evaluation framework. When retrieved 
+context contains image chunks (empty text fields), RAGAS 
+scores are skipped for those responses to avoid incorrect 
+faithfulness scoring.
+
+**Production solution (not implemented in this version):**
+Two-tier evaluation — RAGAS for text/table chunks, 
+Gemini vision self-evaluation for image chunks. 
+Known tradeoff: self-serving bias when using the same 
+model for generation and evaluation.
+
 ### 🐛 Issues Encountered & Resolutions
 
 **Issue 1: Cross-encoder dropping image chunks due to empty text**
