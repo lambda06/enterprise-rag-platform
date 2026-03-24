@@ -32,86 +32,16 @@ import logging
 from typing import Any
 
 import numpy as np
-from sentence_transformers import CrossEncoder
 
 from app.rag.embeddings import embedding_service
+from app.rag.reranker import reranker_service
 from app.vectorstore.qdrant_client import QdrantService
 
 logger = logging.getLogger(__name__)
 
-# ─── Cross-encoder reranker singleton ────────────────────────────────────────
-# ms-marco-MiniLM-L-6-v2: ~24 MB, trained on MS-MARCO passage ranking.
-# Loaded lazily and fault-tolerantly: if HuggingFace is unreachable (firewall,
-# no internet, 403) the server still starts and serves requests — reranking is
-# simply skipped and the pipeline falls back to hybrid-search ranking.
-_RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-
-try:
-    logger.info("Loading cross-encoder reranker: %s", _RERANKER_MODEL)
-    _reranker: CrossEncoder | None = CrossEncoder(_RERANKER_MODEL, device="cpu")
-    logger.info("Cross-encoder reranker ready.")
-except Exception as _exc:
-    logger.warning(
-        "Cross-encoder reranker could not be loaded (%s). "
-        "Retrieval will use hybrid-search ranking only. "
-        "To fix: ensure huggingface.co is reachable, or set HF_TOKEN, or "
-        "pre-download the model with: "
-        "python -c \"from sentence_transformers import CrossEncoder; "
-        "CrossEncoder('%s')\"",
-        _exc,
-        _RERANKER_MODEL,
-    )
-    _reranker = None
-
 # How many candidates to fetch from hybrid search before reranking.
 # E.g., top_k=5 with factor=4 → fetch 20 candidates, rerank, return best 5.
 RERANK_FACTOR: int = 4
-
-
-def _rerank(
-    query: str,
-    candidates: list[dict[str, Any]],
-    top_k: int,
-) -> list[dict[str, Any]]:
-    """Score and re-sort candidates with the cross-encoder (synchronous).
-
-    If the reranker model is unavailable (failed to load), falls back to
-    returning the first ``top_k`` candidates ordered by hybrid-search RRF score.
-
-    Args:
-        query:      The raw user query string.
-        candidates: List of dicts with at least a ``"text"`` key.
-        top_k:      Number of results to return after reranking.
-
-    Returns:
-        Top ``top_k`` dicts from ``candidates``, re-sorted by cross-encoder score
-        (or by original RRF order if the reranker is unavailable).
-    """
-    if not candidates:
-        return []
-
-    # ── Graceful fallback if the reranker model failed to load ────────────────
-    if _reranker is None:
-        logger.debug("Reranker unavailable — returning top-%d by RRF order.", top_k)
-        return candidates[:top_k]
-
-    pairs = [(query, hit["text"]) for hit in candidates]
-
-    # predict() returns a numpy array of float32 logits — higher = more relevant
-    scores: np.ndarray = _reranker.predict(pairs, show_progress_bar=False)
-
-    ranked = sorted(
-        zip(scores.tolist(), candidates),
-        key=lambda t: t[0],
-        reverse=True,
-    )
-
-    logger.debug(
-        "Reranker top scores: %s",
-        [round(s, 3) for s, _ in ranked[:top_k]],
-    )
-
-    return [hit for _, hit in ranked[:top_k]]
 
 
 class RetrievalService:
@@ -166,7 +96,7 @@ class RetrievalService:
         # ── Stage 2: cross-encoder reranking ────────────────────────────────
         # Dispatched to a thread: CrossEncoder.predict is a blocking CPU call.
         reranked: list[dict[str, Any]] = await asyncio.to_thread(
-            _rerank, query, raw_candidates, top_k
+            reranker_service.rerank, query, raw_candidates, top_k
         )
 
         # hybrid_search already returns {"text": ..., "metadata": ..., "rrf_score": ...}
@@ -219,7 +149,7 @@ class RetrievalService:
 
         # Stage 2 — rerank
         reranked_raw: list[dict] = await asyncio.to_thread(
-            _rerank, query, candidates, top_k
+            reranker_service.rerank, query, candidates, top_k
         )
 
         # Strip rrf_score from the final result set (keeps pipeline contract)
@@ -288,7 +218,7 @@ class RetrievalService:
 
         # Rerank text candidates normally
         reranked_text: list[dict] = await asyncio.to_thread(
-            _rerank, query, text_candidates, top_k
+            reranker_service.rerank, query, text_candidates, top_k
         )
 
         # Merge image candidates back — cap total at top_k
