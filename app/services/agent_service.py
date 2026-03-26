@@ -73,6 +73,7 @@ def _make_cache_key(session_id: str, question: str) -> str:
 def _build_initial_state(
     question: str,
     session_id: str,
+    lf_trace: Any,
     evaluate: bool = False,
 ) -> AgentState:
     """
@@ -85,6 +86,10 @@ def _build_initial_state(
     Args:
         question:   The user's raw question string.
         session_id: Session identifier — scopes memory and cache per session.
+        lf_trace:   The parent Langfuse object (trace or span) to attach child spans to.
+                    Threaded through state so each node can open child spans
+                    without importing AgentService. We pass the ``langgraph-run``
+                    span here so that node spans nest correctly underneath it.
         evaluate:   If ``True``, ``eval_node`` will run RAGAS scoring.
                     Defaults to ``False`` for latency-sensitive paths.
 
@@ -96,6 +101,7 @@ def _build_initial_state(
         current_question=question.strip(),
         session_id=session_id.strip(),
         evaluate=evaluate,
+        lf_trace=lf_trace,    # gives every node access to the parent trace
 
         # ── Node-owned — start empty; each node writes its own keys ──────
         messages=[],
@@ -105,6 +111,7 @@ def _build_initial_state(
         reranked_chunks=[],
         final_answer="",
         evaluation_scores={},
+        token_usage={},   # populated by router_node and llm_node
         error="",
     )
 
@@ -279,7 +286,7 @@ class AgentService:
                 question[:80],
             )
 
-            initial_state = _build_initial_state(question, session_id, evaluate)
+            initial_state = _build_initial_state(question, session_id, graph_span, evaluate)
             completed_state: dict[str, Any] = await agent_graph.ainvoke(initial_state)
             response = _extract_response(completed_state)
 
@@ -335,14 +342,35 @@ class AgentService:
                 tracer.end_span(write_span, output={"stored": False, "error": str(exc)})
 
         # ── End trace ────────────────────────────────────────────────────
+        # Aggregate token usage written by router_node and llm_node into a
+        # single trace-level summary.  This gives one number representing the
+        # full Gemini token cost of this user interaction, visible in Langfuse.
+        #
+        # High total_request_tokens on simple questions may indicate the RAG
+        # context window is over-filled (too many or too-large chunks).
+        token_usage: dict = completed_state.get("token_usage", {})
+        router_tokens = token_usage.get("router_input_tokens", 0)
+        llm_total     = token_usage.get("total_tokens", 0)
+        total_request_tokens: int = router_tokens + llm_total
+
         tracer.end_trace(
             lf_trace,
             output={"answer": response["answer"][:200]},
             metadata={
-                "routing_decision":  response["routing_decision"],
-                "evaluation_scores": response["evaluation_scores"],
-                "cache_hit":         False,
-                "error":             response["error"],
+                "routing_decision":    response["routing_decision"],
+                "evaluation_scores":   response["evaluation_scores"],
+                "cache_hit":           False,
+                "error":               response["error"],
+                # ── Token summary (single number = full cost of this request)
+                "total_request_tokens": total_request_tokens,
+                "token_breakdown": {
+                    "router_input_tokens": router_tokens,
+                    "llm_input_tokens":    token_usage.get("input_tokens", 0),
+                    "llm_output_tokens":   token_usage.get("output_tokens", 0),
+                    "llm_total_tokens":    llm_total,
+                    "context_chars":       token_usage.get("context_chars", 0),
+                    "question_chars":      token_usage.get("question_chars", 0),
+                },
             },
         )
 

@@ -26,7 +26,7 @@ class RerankerService:
         # Check if local fine-tuned model path exists and contains a valid model config
         if os.path.exists(finetuned_path) and os.path.exists(finetuned_path / "config.json"):
             try:
-                self.model = CrossEncoder(str(finetuned_path), device="cpu")
+                self.model = CrossEncoder(str(finetuned_path), device="cpu", local_files_only=True)
                 self._model_source = "finetuned"
                 logger.info("Loaded fine-tuned reranker from models/finetuned-reranker/")
             except Exception as e:

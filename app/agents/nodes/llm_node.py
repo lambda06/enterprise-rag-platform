@@ -19,6 +19,13 @@ This node is the final generation step.  It handles three distinct paths:
       This is intentional: calling the LLM for harmful/irrelevant requests
       wastes tokens and risks generating unsafe content even with guardrails.
 
+LLM provider
+------------
+This node uses **Gemini 2.0 Flash** (via ``GeminiLLMService``) as the
+primary generation provider.  Gemini's ``response.usage_metadata`` exposes
+real token counts (``prompt_token_count``, ``candidates_token_count``) that
+are captured here and forwarded to ``agent_service`` for trace-level aggregation.
+
 Output
 ------
 The node always writes ``final_answer`` (str) to the returned state dict.
@@ -33,7 +40,8 @@ import logging
 from typing import Any
 
 from app.agents.state import AgentState
-from app.llm.groq_client import groq_client
+from app.llm.gemini_client import gemini_llm_service
+from app.observability.langfuse_tracer import tracer
 
 logger = logging.getLogger(__name__)
 
@@ -103,32 +111,20 @@ MAX_ANSWER_TOKENS: int = 1024
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _build_rag_messages(question: str, chunks: list[dict[str, Any]]) -> list[dict[str, str]]:
+def _build_rag_context(question: str, chunks: list[dict[str, Any]]) -> tuple[list[str], str]:
     """
-    Build the Groq message list for a RAG-grounded answer.
-
-    Formats each chunk as a clearly delimited context block so the model can
-    reference them by number.  Metadata (source, page) is appended inline to
-    allow the model to include useful citations without hallucinating file paths.
-
-    Args:
-        question: The user's raw question string.
-        chunks:   Reranked chunks — each a dict with ``"text"`` and ``"metadata"`` keys.
+    Build the context chunks list and formatted question string for RAG generation.
 
     Returns:
-        A list of role/content message dicts ready for the Groq chat API.
+        (context_strings, question_str) where context_strings is a list of
+        formatted chunk strings, one per chunk, and question_str is the plain
+        question ready to append.
     """
-    messages: list[dict[str, str]] = [
-        {"role": "system", "content": RAG_SYSTEM_PROMPT},
-    ]
-
-    # Each chunk becomes its own user message so the model processes them as
-    # discrete, citable units rather than one undifferentiated blob of text.
+    context_strings: list[str] = []
     for i, chunk in enumerate(chunks, start=1):
         text = chunk.get("text", "").strip()
         meta = chunk.get("metadata", {})
 
-        # Build a compact source label from whatever metadata is available.
         source = (
             meta.get("source")
             or meta.get("filename")
@@ -139,28 +135,81 @@ def _build_rag_messages(question: str, chunks: list[dict[str, Any]]) -> list[dic
         page = meta.get("page") or meta.get("page_number")
         source_label = f"{source}, page {page}" if page else source
 
-        block = f"[Context {i}] (Source: {source_label})\n{text}"
-        messages.append({"role": "user", "content": block})
+        context_strings.append(f"[Context {i}] (Source: {source_label})\n{text}")
 
-    # Final user turn: the actual question.
-    messages.append({"role": "user", "content": f"Question: {question}"})
-    return messages
+    return context_strings, question
 
 
-def _build_direct_messages(question: str) -> list[dict[str, str]]:
+# ---------------------------------------------------------------------------
+# Gemini sync callers (dispatched to thread pool)
+# ---------------------------------------------------------------------------
+
+def _call_gemini_rag_sync(
+    question: str,
+    chunks: list[dict[str, Any]],
+) -> tuple[str, dict[str, int]]:
     """
-    Build the Groq message list for a direct (no-retrieval) answer.
+    Blocking Gemini call for RAG path — returns (answer, usage).
 
-    Args:
-        question: The user's raw question string.
-
-    Returns:
-        A minimal two-message list: system prompt + user question.
+    Uses a custom system prompt that restricts the model to citing only the
+    provided context blocks.  Calls ``_call_text_sync_with_usage`` which
+    returns real Gemini token counts from ``response.usage_metadata``.
     """
-    return [
-        {"role": "system", "content": DIRECT_SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
+    from google.genai import types as gtypes
+
+    # Override system instruction for RAG grounding
+    config = gtypes.GenerateContentConfig(
+        system_instruction=RAG_SYSTEM_PROMPT,
+        temperature=0.0,
+        max_output_tokens=MAX_ANSWER_TOKENS,
+    )
+
+    parts: list[str] = []
+    for i, chunk in enumerate(chunks, start=1):
+        text = chunk.get("text", "").strip()
+        meta = chunk.get("metadata", {})
+        source = (
+            meta.get("source") or meta.get("filename")
+            or meta.get("file_name") or meta.get("file_path") or "Unknown source"
+        )
+        page = meta.get("page") or meta.get("page_number")
+        source_label = f"{source}, page {page}" if page else source
+        parts.append(f"[Context {i}] (Source: {source_label})\n{text}")
+    parts.append(f"Question: {question}")
+    prompt = "\n\n".join(parts)
+
+    from app.llm.gemini_client import gemini_llm_service as svc
+    response = svc._client.models.generate_content(  # noqa: SLF001
+        model=svc._model_name,  # noqa: SLF001
+        contents=prompt,
+        config=config,
+    )
+    usage = svc._parse_usage(getattr(response, "usage_metadata", None))  # noqa: SLF001
+    return response.text or "", usage
+
+
+def _call_gemini_direct_sync(question: str) -> tuple[str, dict[str, int]]:
+    """
+    Blocking Gemini call for direct (no-retrieval) path — returns (answer, usage).
+
+    Uses the DIRECT_SYSTEM_PROMPT so the model knows it may use parametric
+    knowledge rather than being restricted to context blocks.
+    """
+    from google.genai import types as gtypes
+    from app.llm.gemini_client import gemini_llm_service as svc
+
+    config = gtypes.GenerateContentConfig(
+        system_instruction=DIRECT_SYSTEM_PROMPT,
+        temperature=0.0,
+        max_output_tokens=MAX_ANSWER_TOKENS,
+    )
+    response = svc._client.models.generate_content(  # noqa: SLF001
+        model=svc._model_name,  # noqa: SLF001
+        contents=question,
+        config=config,
+    )
+    usage = svc._parse_usage(getattr(response, "usage_metadata", None))  # noqa: SLF001
+    return response.text or "", usage
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +222,26 @@ async def llm_node(state: AgentState) -> dict[str, Any]:
 
     Path selection logic:
       1. routing_decision == "out_of_scope"  → return polite refusal (no LLM)
-      2. reranked_chunks non-empty           → RAG-grounded answer
-      3. otherwise                           → direct parametric answer
+      2. reranked_chunks non-empty           → RAG-grounded answer (Gemini)
+      3. otherwise                           → direct parametric answer (Gemini)
 
-    Note: ``reranked_chunks`` takes priority over ``retrieved_chunks`` because
-    the RERANKER node (if present) produces higher-quality ordering.  If only
-    ``retrieved_chunks`` is populated (RERANKER was skipped), this node falls
-    back gracefully by checking both.
+    Token tracking
+    --------------
+    Gemini's ``response.usage_metadata`` returns real token counts
+    (``prompt_token_count`` and ``candidates_token_count``).  We extract
+    these and compute two additional proxy metrics from character counts:
+
+      context_chars   — total characters across all retrieved chunk texts
+      question_chars  — characters in the user's question string alone
+
+    The ``context_chars / question_chars`` ratio reveals how much of the
+    prompt window is consumed by retrieval output vs the question itself.
+    A ratio > 10:1 suggests chunks are too large; consider reducing
+    ``chunk_size`` in the ingestion pipeline to improve prompt efficiency.
+
+    All token data is written to ``state["token_usage"]`` so that
+    ``AgentService`` can aggregate a ``total_request_tokens`` into the
+    top-level Langfuse trace metadata.
 
     Args:
         state: The current ``AgentState`` dict.  Reads:
@@ -194,6 +256,11 @@ async def llm_node(state: AgentState) -> dict[str, Any]:
         ``final_answer``
             The generated (or canned) answer string.  Never empty on success.
 
+        ``token_usage``
+            Dict with keys ``input_tokens``, ``output_tokens``,
+            ``total_tokens``, ``context_chars``, ``question_chars``.
+            All zeros for the out_of_scope path (no LLM call).
+
         ``error``
             Empty string on success; human-readable message on failure.
 
@@ -203,18 +270,16 @@ async def llm_node(state: AgentState) -> dict[str, Any]:
     # ------------------------------------------------------------------ #
     # Upstream error propagation                                          #
     # ------------------------------------------------------------------ #
-    # If a critical upstream node (router, rag) set an error AND left
-    # current_question empty, there is nothing meaningful to generate.
-    # Pass the error through rather than producing a blank answer.
     upstream_error: str = state.get("error", "")
     if upstream_error and not state.get("current_question", "").strip():
         logger.warning(
             "llm_node: upstream error detected with no question — skipping generation."
         )
-        return {"final_answer": "", "error": upstream_error}
+        return {"final_answer": "", "token_usage": {}, "error": upstream_error}
 
     routing_decision: str = state.get("routing_decision", "")
     question: str = state.get("current_question", "").strip()
+    lf_trace = state.get("lf_trace")
 
     # ------------------------------------------------------------------ #
     # Path 3 — Out of scope: return refusal immediately, no LLM call     #
@@ -223,13 +288,14 @@ async def llm_node(state: AgentState) -> dict[str, Any]:
         logger.info("llm_node: out_of_scope — returning polite refusal without LLM call.")
         return {
             "final_answer": OUT_OF_SCOPE_REFUSAL,
+            "token_usage": {},
             "error": "",
         }
 
     if not question:
         msg = "llm_node received an empty current_question; cannot generate answer."
         logger.warning(msg)
-        return {"final_answer": "", "error": msg}
+        return {"final_answer": "", "token_usage": {}, "error": msg}
 
     # ------------------------------------------------------------------ #
     # Determine context: prefer reranked_chunks, fall back to retrieved   #
@@ -240,47 +306,115 @@ async def llm_node(state: AgentState) -> dict[str, Any]:
         or []
     )
 
+    # Pre-compute character proxies (before the async call so they appear in
+    # the span input even if generation fails).
+    context_chars = sum(len(c.get("text", "")) for c in chunks)
+    question_chars = len(question)
+    path = "rag" if chunks else "direct"
+
+    # Unique content types present in context (e.g. ['text', 'image', 'table']).
+    # Used in the span to show whether the LLM received multimodal input.
+    content_types_in_context: list[str] = list({
+        c.get("metadata", {}).get("content_type", "text")
+        for c in chunks
+    })
+    multimodal_used: bool = any(
+        c.get("metadata", {}).get("content_type") == "image"
+        for c in chunks
+    )
+
+    # Open the llm-generation span BEFORE the Gemini call so latency is captured.
+    llm_span = tracer.start_generation(
+        lf_trace,
+        "llm-generation",
+        model=gemini_llm_service._model_name,  # noqa: SLF001
+        model_parameters={"temperature": 0.0, "max_output_tokens": MAX_ANSWER_TOKENS},
+        input={
+            "path":                   path,
+            "question":               question[:200],
+            "chunk_count":            len(chunks),
+            "context_chars":          context_chars,
+            "question_chars":         question_chars,
+            "content_types_in_context": content_types_in_context,
+            "multimodal_used":         multimodal_used,
+        },
+    )
+
     try:
         if chunks:
             # ── Path 1: RAG-grounded answer ──────────────────────────────
             logger.info(
-                "llm_node: RAG path — %d context chunks for question=%r",
+                "llm_node: RAG path (Gemini) — %d context chunks for question=%r",
                 len(chunks),
                 question[:80],
             )
-            messages = _build_rag_messages(question, chunks)
+            answer, usage = await asyncio.to_thread(
+                _call_gemini_rag_sync, question, chunks
+            )
 
         else:
             # ── Path 2: Direct answer from parametric knowledge ──────────
             logger.info(
-                "llm_node: direct path — no context chunks for question=%r",
+                "llm_node: direct path (Gemini) — no context chunks for question=%r",
                 question[:80],
             )
-            messages = _build_direct_messages(question)
+            answer, usage = await asyncio.to_thread(
+                _call_gemini_direct_sync, question
+            )
 
-        # Blocking Groq SDK call dispatched to a thread pool so the event
-        # loop remains free (same pattern as router_node and rag_node).
-        answer: str = await asyncio.to_thread(
-            groq_client._call_sync,  # noqa: SLF001
-            messages,
-            MAX_ANSWER_TOKENS,
-        )
+        # ── Assemble token metadata ──────────────────────────────────────
+        token_usage: dict[str, Any] = {
+            **usage,                          # input_tokens, output_tokens, total_tokens
+            "context_chars":  context_chars,  # chars consumed by retrieved chunks
+            "question_chars": question_chars, # chars from the user's question
+        }
 
         logger.info(
-            "llm_node: generated answer (%d chars) for question=%r",
+            "llm_node: generated answer (%d chars) | tokens in=%d out=%d total=%d "
+            "context_chars=%d question_chars=%d",
             len(answer),
-            question[:80],
+            usage.get("input_tokens", 0),
+            usage.get("output_tokens", 0),
+            usage.get("total_tokens", 0),
+            context_chars,
+            question_chars,
+        )
+
+        tracer.end_span(
+            llm_span,
+            output={
+                # Real Gemini token counts from response.usage_metadata.
+                "input_tokens":  usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "total_tokens":  usage.get("total_tokens", 0),
+                # context_chars vs question_chars shows how much of the prompt
+                # window is consumed by retrieval vs the user's own question.
+                # A ratio > 10:1 suggests chunks are too large — reduce chunk_size
+                # in the ingestion pipeline to improve prompt efficiency.
+                "context_chars":  context_chars,
+                "question_chars": question_chars,
+                # token_efficiency = output_tokens / input_tokens.
+                # Low values mean the model is consuming many tokens to produce
+                # a short answer — could indicate prompt bloat.
+                "token_efficiency": round(
+                    usage.get("output_tokens", 0) / usage.get("input_tokens", 1),
+                    3,
+                ),
+            },
         )
 
         return {
             "final_answer": answer.strip(),
-            "error": "",
+            "token_usage":  token_usage,
+            "error":        "",
         }
 
     except Exception as exc:  # noqa: BLE001
         msg = f"llm_node generation failed: {exc}"
         logger.exception(msg)
+        tracer.end_span(llm_span, output={"error": msg})
         return {
             "final_answer": "",
-            "error": msg,
+            "token_usage":  {},
+            "error":        msg,
         }

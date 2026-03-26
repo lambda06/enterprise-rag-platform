@@ -32,6 +32,10 @@ class _NoOpSpan:
     """Silent placeholder for a Langfuse span/generation when tracing is off."""
     def end(self, **kwargs: Any) -> None: ...
     def update(self, **kwargs: Any) -> None: ...
+    def span(self, *args: Any, **kwargs: Any) -> _NoOpSpan:
+        return _NoOpSpan()
+    def generation(self, *args: Any, **kwargs: Any) -> _NoOpSpan:
+        return _NoOpSpan()
 
 
 class _NoOpTrace:

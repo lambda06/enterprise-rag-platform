@@ -11,32 +11,25 @@ so that both intermediate and final results are captured in state:
              Stored in ``state["retrieved_chunks"]`` — raw candidates before
              reranking.  Useful for debugging, tracing, and evaluation.
 
-  Stage 2 — Cross-encoder reranking (ms-marco-MiniLM-L-6-v2)
+  Stage 2 — Cross-encoder reranking (ms-marco-MiniLM-L-6-v2 or fine-tuned)
              Stored in ``state["reranked_chunks"]`` — the final top-k chunks
              ordered by cross-encoder relevance score.  This is what
              ``llm_node`` uses to build the LLM context window.
 
-Why ``retrieve_staged()`` instead of ``retrieve()``?
------------------------------------------------------
-``retrieve()`` collapses both stages into one list — you only get the final
-reranked results with no visibility into the raw hybrid-search candidates.
-``retrieve_staged()`` returns ``(candidates, reranked)`` so we can:
+Langfuse spans
+--------------
+This node opens two consecutive child spans on the parent trace:
 
-  • Write raw candidates → ``retrieved_chunks`` and reranked → ``reranked_chunks``.
-  • Let ``llm_node`` always prefer ``reranked_chunks`` (the higher-quality set)
-    without any ambiguity about which field holds which stage.
-  • Preserve the raw candidates for Langfuse tracing, evaluation, and
-    debugging without an extra service call.
+  rag-retrieval — hybrid search stage.
+      Logs ``chunk_count`` (candidates returned) and ``character_count``
+      (total chars across all candidate texts) so operators can see
+      how much raw text is flowing into the reranker.
 
-Why import the singleton directly?
------------------------------------
-``retrieval_service`` is a module-level singleton created in
-``app.rag.retrieval`` at import time.  Importing it directly here means:
-
-  • No repeated instantiation — the same ``RetrievalService`` instance,
-    embedding model, and Qdrant connection are reused across every graph run.
-  • Easy to mock in tests — replace ``rag_node.retrieval_service`` with a stub.
-  • Consistent with the pattern used by ``pipeline.py`` and ``groq_client``.
+  reranking — cross-encoder reranking stage.
+      Logs ``model_source`` ("finetuned" or "base"), ``candidates_in``,
+      ``chunks_out``, and ``chunks_dropped`` (candidates_in − chunks_out).
+      High ``chunks_dropped`` with a low ``chunks_out`` is expected behaviour
+      — it means the reranker aggressively filtered low-relevance candidates.
 """
 
 from __future__ import annotations
@@ -45,14 +38,14 @@ import logging
 from typing import Any
 
 from app.agents.state import AgentState
+from app.core.config import get_settings
+from app.observability.langfuse_tracer import tracer
 from app.rag.retrieval import retrieval_service
+from app.rag.reranker import reranker_service
 
 logger = logging.getLogger(__name__)
 
 # Default number of final chunks returned to the GENERATOR node.
-# Chosen as a balance between context richness and prompt-token cost:
-#   • Too few (< 3): insufficient evidence for multi-part questions.
-#   • Too many (> 8): risks hitting the LLM context window limit and adds noise.
 DEFAULT_TOP_K: int = 5
 
 
@@ -60,79 +53,56 @@ async def rag_node(state: AgentState, top_k: int = DEFAULT_TOP_K) -> dict[str, A
     """
     LangGraph node: retrieve relevant chunks for the current question.
 
-    Guards
-    ------
-    Returns an error immediately (without calling the vector store) if
-    ``routing_decision`` is not ``"rag"``.  This prevents the node from
-    doing expensive I/O when called incorrectly during graph development or
-    testing.  In production the ROUTER's conditional edges should ensure
-    this guard never triggers, but defensive programming here makes bugs
-    visible early.
+    Opens two Langfuse child spans: ``rag-retrieval`` (hybrid search) and
+    ``reranking`` (cross-encoder), both attached to the parent trace passed
+    in via ``state["lf_trace"]``.
 
     Args:
         state:  The current ``AgentState`` dict.  Must contain:
                 - ``current_question`` — the raw user query string.
                 - ``routing_decision`` — must equal ``"rag"``.
-        top_k:  Number of final reranked chunks to return.  Defaults to
-                ``DEFAULT_TOP_K`` (5).  Pass a different value when calling
-                the node directly in tests or scripts.
+                - ``lf_trace``         — Langfuse trace for child spans.
+        top_k:  Number of final reranked chunks to return.
 
     Returns:
-        A partial state dict containing only the keys this node owns:
-
-        ``retrieved_chunks``
-            Raw hybrid-search candidates (before reranking).  List of dicts
-            with ``"text"``, ``"metadata"``, and ``"rrf_score"`` keys.
-            Useful for tracing and evaluation; NOT what the LLM sees.
-
-        ``reranked_chunks``
-            Final top-k chunks after cross-encoder reranking, ordered by
-            relevance score (most relevant first).  Each dict has
-            ``"text"`` and ``"metadata"`` keys.  This is what ``llm_node``
-            uses to build the LLM context window.
-
-        ``error``
-            Empty string on success.  Human-readable message on failure —
-            a non-empty value causes the OUTPUT node's conditional edge to
-            route to the ERROR node for graceful degradation.
-
-    Raises:
-        Does NOT raise — all exceptions are caught and written to ``error``.
+        Partial state dict with ``retrieved_chunks``, ``reranked_chunks``,
+        and ``error``.
     """
     # ------------------------------------------------------------------ #
-    # Guard: verify this node should be running                           #
+    # Guard                                                               #
     # ------------------------------------------------------------------ #
     routing_decision: str = state.get("routing_decision", "")
-
     if routing_decision != "rag":
-        # This should never happen in a correctly wired graph, but catches
-        # misconfigured edges during development.
         msg = (
             f"rag_node invoked with routing_decision={routing_decision!r}. "
             "Expected 'rag'. Skipping retrieval."
         )
         logger.error(msg)
-        return {
-            "retrieved_chunks": [],
-            "error": msg,
-        }
+        return {"retrieved_chunks": [], "error": msg}
 
-    # ------------------------------------------------------------------ #
-    # Extract question                                                    #
-    # ------------------------------------------------------------------ #
     question: str = state.get("current_question", "").strip()
+    lf_trace = state.get("lf_trace")
 
     if not question:
         msg = "rag_node received an empty current_question; cannot retrieve."
         logger.warning(msg)
-        return {
-            "retrieved_chunks": [],
-            "error": msg,
-        }
+        return {"retrieved_chunks": [], "error": msg}
 
     # ------------------------------------------------------------------ #
-    # Hybrid retrieval + cross-encoder reranking                          #
+    # Span 1: rag-retrieval (hybrid search)                              #
     # ------------------------------------------------------------------ #
+    candidate_k = top_k * 4   # RERANK_FACTOR from retrieval.py
+
+    retrieval_span = tracer.start_span(
+        lf_trace,
+        "rag-retrieval",
+        input={
+            "query":           question[:200],
+            "candidate_k":     candidate_k,
+            "collection_name": get_settings().qdrant.collection_name,
+        },
+    )
+
     try:
         logger.debug(
             "rag_node starting staged retrieval for question=%r (top_k=%d)",
@@ -140,43 +110,104 @@ async def rag_node(state: AgentState, top_k: int = DEFAULT_TOP_K) -> dict[str, A
             top_k,
         )
 
-        # ``retrieve_staged`` returns (raw_candidates, reranked):
+        # retrieve_staged returns (raw_candidates, reranked):
         #   raw_candidates — all hybrid-search hits (top_k * RERANK_FACTOR)
         #   reranked       — final top_k after cross-encoder scoring
-        # Both are async-safe: blocking calls are offloaded via to_thread.
         raw_candidates, reranked = await retrieval_service.retrieve_staged(
             query=question,
             top_k=top_k,
         )
 
-        logger.info(
-            "rag_node: %d candidate(s) → %d reranked chunk(s) for question=%r",
-            len(raw_candidates),
-            len(reranked),
-            question[:80],
+        # Compute character_count across all candidate texts.
+        # A high character_count with a moderate chunk_count indicates
+        # large chunks — consider reducing chunk_size in the ingestion pipeline.
+        candidate_char_count = sum(len(c.get("text", "")) for c in raw_candidates)
+
+        tracer.end_span(
+            retrieval_span,
+            output={
+                "chunk_count":   len(raw_candidates),
+                # Renamed to context_chars for consistency with llm-generation span.
+                # A high value with a moderate chunk_count = large chunks.
+                "context_chars": candidate_char_count,
+                "top_rrf_scores": [
+                    round(float(c.get("rrf_score", 0)), 4)
+                    for c in raw_candidates[:5]
+                ],
+            },
         )
-
-        if not reranked:
-            # Zero results is not an error — the vector store may simply have
-            # no relevant documents.  The GENERATOR node will handle this case
-            # (e.g., respond "I couldn't find relevant documents").
-            logger.warning(
-                "rag_node: 0 reranked chunks for question=%r. "
-                "The vector store may be empty or the query may not match any document.",
-                question[:80],
-            )
-
-        return {
-            "retrieved_chunks": raw_candidates,   # raw stage-1 candidates
-            "reranked_chunks":  reranked,          # final stage-2 context
-            "error": "",
-        }
 
     except Exception as exc:  # noqa: BLE001
         msg = f"rag_node retrieval failed: {exc}"
         logger.exception(msg)
-        return {
-            "retrieved_chunks": [],
-            "reranked_chunks":  [],
-            "error": msg,
-        }
+        tracer.end_span(retrieval_span, output={"error": msg})
+        return {"retrieved_chunks": [], "reranked_chunks": [], "error": msg}
+
+    # ------------------------------------------------------------------ #
+    # Span 2: reranking (cross-encoder)                                  #
+    # ------------------------------------------------------------------ #
+    reranking_span = tracer.start_span(
+        lf_trace,
+        "reranking",
+        input={
+            "candidates_in": len(raw_candidates),
+            "top_k":         top_k,
+        },
+    )
+
+    # top_reranker_score: the highest score assigned to any chunk by the
+    # cross-encoder. A high score (close to 1.0 for a well-calibrated model)
+    # means the reranker found a very relevant chunk; a low score across all
+    # chunks is a signal that the retrieved candidates are weakly relevant.
+    #
+    # Note: rerank() returns dicts without scores (score was used for sorting).
+    # We re-read the raw scores via the reranker_service's last predict() call
+    # as a proxy by checking the first chunk's position — for now we log None
+    # when scores aren't directly accessible, and rely on chunks_dropped instead.
+    chunks_dropped = len(raw_candidates) - len(reranked)
+
+    # Compute top reranker score from raw candidate pairs if reranker is active.
+    top_reranker_score: float | None = None
+    if reranker_service.model is not None and raw_candidates:
+        import numpy as np
+        pairs = [(question, c.get("text", "")) for c in raw_candidates[:1]]
+        scores = reranker_service.model.predict(pairs, show_progress_bar=False)
+        top_reranker_score = round(float(np.max(scores)), 4)
+
+    tracer.end_span(
+        reranking_span,
+        output={
+            # "finetuned" or "base" — confirms which cross-encoder is active.
+            "model_source":       reranker_service.model_source or "unavailable",
+            "chunks_out":         len(reranked),
+            # High chunks_dropped is normal — aggressive reranker filtering.
+            "chunks_dropped":     chunks_dropped,
+            # Confidence signal: how relevant was the best candidate?
+            # Low top_reranker_score (<0.0 for ms-marco logits) means
+            # no retrieved chunk is strongly relevant to the query.
+            "top_reranker_score": top_reranker_score,
+        },
+    )
+
+    logger.info(
+        "rag_node: %d candidate(s) → %d reranked chunk(s) (dropped=%d, model=%s) "
+        "for question=%r",
+        len(raw_candidates),
+        len(reranked),
+        chunks_dropped,
+        reranker_service.model_source,
+        question[:80],
+    )
+
+    if not reranked:
+        logger.warning(
+            "rag_node: 0 reranked chunks for question=%r. "
+            "The vector store may be empty or the query may not match any document.",
+            question[:80],
+        )
+
+    return {
+        "retrieved_chunks": raw_candidates,
+        "reranked_chunks":  reranked,
+        "error":            "",
+    }

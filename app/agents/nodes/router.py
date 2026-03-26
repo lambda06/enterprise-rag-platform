@@ -29,7 +29,8 @@ import logging
 import re
 
 from app.agents.state import AgentState
-from app.llm.groq_client import groq_client
+from app.llm.gemini_client import gemini_llm_service
+from app.observability.langfuse_tracer import tracer
 
 logger = logging.getLogger(__name__)
 
@@ -188,20 +189,22 @@ def _parse_route(raw: str) -> str:
     return ROUTE_RAG
 
 
-def _classify_sync(question: str) -> str:
+def _classify_sync(question: str) -> tuple[str, dict[str, int]]:
     """
-    Blocking Groq call that returns the raw classification string.
+    Blocking Gemini call that returns (raw_label, usage_dict).
 
     Isolated from the async layer so it can be run in a thread via
-    ``asyncio.to_thread``, matching the pattern used throughout the codebase
-    (see ``GroqLLMService._call_sync``).
+    ``asyncio.to_thread``, matching the pattern used throughout the codebase.
+
+    Uses ``GeminiLLMService._call_classification_sync_with_usage`` which
+    returns real Gemini token counts from ``response.usage_metadata``.
+    The router runs on **every** request, so ``input_tokens`` here is a
+    useful signal: if it creeps up, the classification prompt is getting
+    too long and adding latency at scale.  Target: keep this under ~250 tokens.
     """
     prompt = ROUTER_CLASSIFICATION_PROMPT.format(question=question)
 
     # Build a minimal message list: system + single user turn.
-    # We bypass ``GroqLLMService.generate`` because routing needs a custom
-    # system prompt and no context chunks — the existing ``generate`` method
-    # is designed for RAG generation, not zero-shot classification.
     messages = [
         {
             "role": "system",
@@ -213,11 +216,14 @@ def _classify_sync(question: str) -> str:
         {"role": "user", "content": prompt},
     ]
 
-    # Re-use the singleton client's underlying Groq SDK client directly.
-    # This avoids instantiating a second HTTP connection pool and shares the
-    # same API key / model configuration declared in settings.
-    raw = groq_client._call_sync(messages, max_tokens=10)  # noqa: SLF001
-    return raw
+    # ``_call_classification_sync_with_usage`` flattens the message list into
+    # a single prompt and calls generate_content with temperature=0.0 and
+    # max_output_tokens=10 — matching the deterministic, one-word-response
+    # requirement of the router without a full chat session.
+    raw, usage = gemini_llm_service._call_classification_sync_with_usage(  # noqa: SLF001
+        messages, max_output_tokens=10
+    )
+    return raw, usage
 
 
 async def router_node(state: AgentState) -> dict:
@@ -249,6 +255,7 @@ async def router_node(state: AgentState) -> dict:
         so the graph can degrade gracefully instead of crashing.
     """
     question: str = state.get("current_question", "").strip()
+    lf_trace = state.get("lf_trace")
 
     if not question:
         # Empty question — treat as out_of_scope rather than routing to RAG
@@ -256,35 +263,61 @@ async def router_node(state: AgentState) -> dict:
         logger.warning("router_node received an empty question; routing to out_of_scope.")
         return {
             "routing_decision": ROUTE_OUT_OF_SCOPE,
+            "token_usage": {},
             "error": "",
         }
+
+    # Open a child span so the routing decision appears as a distinct step in
+    # the Langfuse trace alongside retrieval, generation, and evaluation spans.
+    router_span = tracer.start_span(
+        lf_trace,
+        "router",
+        input={
+            "question": question[:200],
+            # Log prompt character count as a size proxy.
+            # The router runs on every request — if this grows, so does latency.
+            "prompt_chars": len(ROUTER_CLASSIFICATION_PROMPT.format(question=question)),
+        },
+    )
 
     try:
         logger.debug("router_node classifying question: %r", question)
 
-        raw_response: str = await asyncio.to_thread(_classify_sync, question)
+        raw_response, usage = await asyncio.to_thread(_classify_sync, question)
         decision: str = _parse_route(raw_response)
 
         logger.info(
-            "router_node decision='%s' for question=%r (raw_llm='%s')",
+            "router_node decision='%s' for question=%r (raw_llm='%s') "
+            "router_input_tokens=%d",
             decision,
             question[:80],
             raw_response.strip(),
+            usage.get("input_tokens", 0),
+        )
+
+        tracer.end_span(
+            router_span,
+            output={
+                "routing_decision": decision,
+                # The router runs on every request — tracking input_tokens here
+                # guards against prompt bloat. Keep this under ~250 tokens;
+                # high values indicate the classification prompt is too long
+                # and is adding latency before every user turn.
+                "input_tokens": usage.get("input_tokens", 0),
+            },
         )
 
         return {
             "routing_decision": decision,
+            "token_usage": {"router_input_tokens": usage.get("input_tokens", 0)},
             "error": "",
         }
 
     except Exception as exc:  # noqa: BLE001
-        # Log the full traceback for observability but do not re-raise —
-        # LangGraph will propagate the partial state and the OUTPUT node's
-        # conditional edge will detect the non-empty error string.
         logger.exception("router_node failed: %s", exc)
+        tracer.end_span(router_span, output={"error": str(exc)})
         return {
-            # Safest fallback on hard failure: attempt RAG rather than refusing
-            # outright — the retrieval node has its own error handling.
             "routing_decision": ROUTE_RAG,
+            "token_usage": {},
             "error": f"Router classification failed: {exc}",
         }

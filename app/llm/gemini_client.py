@@ -83,10 +83,47 @@ class GeminiLLMService:
             max_output_tokens=1024,
         )
 
+    @staticmethod
+    def _parse_usage(usage_metadata: object | None) -> dict[str, int]:
+        """Extract token counts from Gemini response usage_metadata.
+
+        Gemini's ``usage_metadata`` exposes:
+          - ``prompt_token_count``      — tokens consumed by the prompt (input)
+          - ``candidates_token_count``  — tokens in the generated response (output)
+          - ``total_token_count``       — sum of both
+
+        Returns a normalised dict with keys ``input_tokens``, ``output_tokens``,
+        and ``total_tokens``.  All values default to 0 if the attribute is absent
+        (e.g. when Gemini does not return usage data for a given model tier).
+        """
+        if usage_metadata is None:
+            return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        input_t  = getattr(usage_metadata, "prompt_token_count",     0) or 0
+        output_t = getattr(usage_metadata, "candidates_token_count", 0) or 0
+        total_t  = getattr(usage_metadata, "total_token_count",      0) or (input_t + output_t)
+        return {
+            "input_tokens":  input_t,
+            "output_tokens": output_t,
+            "total_tokens":  total_t,
+        }
+
     def _call_text_sync(
         self, question: str, context_chunks: Iterable[str]
     ) -> str:
-        """Blocking text-only generation call."""
+        """Blocking text-only generation call (returns content string only)."""
+        content, _ = self._call_text_sync_with_usage(question, context_chunks)
+        return content
+
+    def _call_text_sync_with_usage(
+        self, question: str, context_chunks: Iterable[str]
+    ) -> tuple[str, dict[str, int]]:
+        """Blocking text-only generation call that also returns token usage.
+
+        Returns:
+            (content, usage) where usage has keys
+            ``input_tokens``, ``output_tokens``, ``total_tokens``.
+            All integers.  Falls back to zeros if the API returns no usage data.
+        """
         parts: list[str] = []
         for i, chunk in enumerate(context_chunks, start=1):
             parts.append(f"Context {i}:\n{chunk}")
@@ -99,9 +136,52 @@ class GeminiLLMService:
                 contents=prompt,
                 config=self._generation_config(),
             )
-            return response.text or ""
+            usage = self._parse_usage(getattr(response, "usage_metadata", None))
+            return response.text or "", usage
         except Exception as exc:
             logger.exception("Gemini text generation failed: %s", exc)
+            raise
+
+    def _call_classification_sync_with_usage(
+        self,
+        messages: list[dict[str, str]],
+        max_output_tokens: int = 10,
+    ) -> tuple[str, dict[str, int]]:
+        """Blocking classification call for the router — returns (label, usage).
+
+        Sends a minimal contents list built from ``messages`` dicts
+        (role/content pairs) as a single concatenated prompt to match
+        the Groq message-list pattern used by router_node.
+
+        Args:
+            messages:          List of {"role": str, "content": str} dicts.
+            max_output_tokens: Upper bound on the generated label (default 10).
+
+        Returns:
+            (raw_label, usage_dict) — label is the raw model text (usually
+            one word); usage_dict has ``input_tokens``, ``output_tokens``,
+            ``total_tokens``.
+        """
+        # Flatten the message list into a single prompt string so we can
+        # use the unified generate_content API without function-calling or
+        # chat sessions (which are unnecessarily complex for one-shot classification).
+        combined = "\n".join(
+            f"{m['role'].upper()}: {m['content']}" for m in messages
+        )
+        config = types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=max_output_tokens,
+        )
+        try:
+            response = self._client.models.generate_content(
+                model=self._model_name,
+                contents=combined,
+                config=config,
+            )
+            usage = self._parse_usage(getattr(response, "usage_metadata", None))
+            return response.text or "", usage
+        except Exception as exc:
+            logger.exception("Gemini classification call failed: %s", exc)
             raise
 
     def _call_multimodal_sync(
@@ -114,6 +194,21 @@ class GeminiLLMService:
 
         All images and text contexts are bundled into a single content list so
         Gemini can reason over them jointly in one forward pass.
+        """
+        content, _ = self._call_multimodal_sync_with_usage(question, context_chunks, image_b64_list)
+        return content
+
+    def _call_multimodal_sync_with_usage(
+        self,
+        question: str,
+        context_chunks: Iterable[str],
+        image_b64_list: List[str],
+    ) -> tuple[str, dict[str, int]]:
+        """Blocking multimodal generation call that also returns token usage.
+
+        Returns:
+            (content, usage) — same usage dict shape as
+            ``_call_text_sync_with_usage``.
         """
         # Build a contents list: text chunks first, then images, then question.
         contents: list = []
@@ -143,7 +238,8 @@ class GeminiLLMService:
                 contents=contents,
                 config=self._generation_config(),
             )
-            return response.text or ""
+            usage = self._parse_usage(getattr(response, "usage_metadata", None))
+            return response.text or "", usage
         except Exception as exc:
             logger.exception("Gemini multimodal generation failed: %s", exc)
             raise

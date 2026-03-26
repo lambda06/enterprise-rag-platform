@@ -44,6 +44,7 @@ from typing import Any
 
 from app.agents.state import AgentState
 from app.evaluation.ragas_evaluator import evaluate_response
+from app.observability.langfuse_tracer import tracer
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,23 @@ async def eval_node(state: AgentState) -> dict[str, Any]:
     # ------------------------------------------------------------------ #
     # Run RAGAS (non-fatal — any exception returns error inside scores)   #
     # ------------------------------------------------------------------ #
+    lf_trace = state.get("lf_trace")
+
+    # Open an evaluation span so RAGAS run time and chunk count are visible
+    # in Langfuse alongside the generation span.
+    eval_span = tracer.start_span(
+        lf_trace,
+        "evaluation",
+        input={
+            "question":        question[:200],
+            # RAGAS uses an internal LLM judge that makes several API calls per
+            # metric. The SDK does not expose those token counts. chunks_evaluated
+            # is logged as a proxy: more chunks = more judge calls = more tokens.
+            "chunks_evaluated": len(contexts),
+            "question_chars":   len(question),
+        },
+    )
+
     try:
         logger.info(
             "eval_node: running RAGAS on question=%r (%d context chunks).",
@@ -175,6 +193,15 @@ async def eval_node(state: AgentState) -> dict[str, Any]:
                 {k: v for k, v in scores.items()},
             )
 
+        tracer.end_span(
+            eval_span,
+            output={
+                "chunks_evaluated": len(contexts),
+                **{k: round(float(v), 4) if isinstance(v, float) else v
+                   for k, v in scores.items()},
+            },
+        )
+
         return {"evaluation_scores": scores, "error": ""}
 
     except Exception as exc:  # noqa: BLE001
@@ -183,4 +210,5 @@ async def eval_node(state: AgentState) -> dict[str, Any]:
         logger.warning(
             "eval_node: unexpected exception during evaluation: %s", exc, exc_info=True
         )
+        tracer.end_span(eval_span, output={"error": str(exc)})
         return {"evaluation_scores": {"error": str(exc)}, "error": ""}

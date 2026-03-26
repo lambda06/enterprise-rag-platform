@@ -197,3 +197,45 @@ class AgentState(dict):
 
     Reset to ``""`` at the start of each new turn.
     """
+
+    # ------------------------------------------------------------------ #
+    # Token tracking                                                      #
+    # ------------------------------------------------------------------ #
+
+    token_usage: dict
+    """
+    Token counts aggregated from Gemini API calls during this turn.
+
+    Set by ``llm_node`` after a text or multimodal generation call:
+        input_tokens   — prompt tokens (system + context + question)
+        output_tokens  — generated answer tokens
+        total_tokens   — input_tokens + output_tokens
+        context_chars  — character count of all retrieved chunk texts
+        question_chars — character count of the user's question
+
+    Also merged by ``router_node`` after its classification call:
+        router_input_tokens — tokens consumed by the routing prompt
+
+    The ``context_chars / question_chars`` ratio indicates how much of the
+    prompt window is consumed by retrieval output vs the question itself.
+    A ratio > 10:1 suggests chunks are too large.
+
+    Set to ``{}`` when no LLM call was made (e.g., out_of_scope path).
+    Agents that skip generation leave this field empty.
+    """
+
+    lf_trace: Any
+    """
+    The Langfuse trace object created by ``AgentService`` for this request.
+
+    Passed into the graph via the initial state so that individual nodes
+    (router, rag, llm, eval) can open their own child spans directly on the
+    same trace without any circular imports or monkeypatching.
+
+    The tracer is fault-tolerant (``_NoOpTrace`` when Langfuse is disabled),
+    so nodes can call ``tracer.start_span(state["lf_trace"], ...)`` safely
+    regardless of whether Langfuse credentials are configured.
+
+    Set by ``_build_initial_state`` in ``agent_service.py``.
+    Reset to ``None`` at graph teardown — never persisted between turns.
+    """

@@ -51,7 +51,8 @@ class GeminiSettings(BaseSettings):
         description="Output dimensionality (MRL sub-3072; requires manual L2 norm)",
     )
     generation_model: str = Field(
-        default="gemini-2.5-flash",
+        # gemini-2.5-flash is also available
+        default="gemini-3.1-flash-lite-preview",
         description="Gemini generation model ID (text + multimodal)",
     )
 
