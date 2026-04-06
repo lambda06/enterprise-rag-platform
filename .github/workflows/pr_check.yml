@@ -61,4 +61,6 @@ jobs:
           pip install pytest httpx
 
       - name: Run Pytest
+        env:
+          PYTHONPATH: .
         run: pytest tests/ -v
