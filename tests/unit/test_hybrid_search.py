@@ -144,9 +144,12 @@ class TestQdrantServiceHybridSearch:
             settings.qdrant.collection_name = "test_collection"
             mock_settings.return_value = settings
 
-            # Mock the search method to return our test hits
+            # Mock the query_points method to return our test hits wrapped in a container
             mock_client = MagicMock()
-            mock_client.search.side_effect = [dense_hits, sparse_hits]
+            mock_client.query_points.side_effect = [
+                SimpleNamespace(points=dense_hits),
+                SimpleNamespace(points=sparse_hits)
+            ]
             MockClient.return_value = mock_client
 
             from app.vectorstore.qdrant_client import QdrantService
@@ -165,7 +168,10 @@ class TestQdrantServiceHybridSearch:
         dense_hits = [_make_hit("doc1", text="The XT-500 sensor calibration guide.")]
         sparse_hits = [_make_hit("doc1", text="The XT-500 sensor calibration guide.")]
 
-        svc._client.search.side_effect = [dense_hits, sparse_hits]
+        svc._client.query_points.side_effect = [
+            SimpleNamespace(points=dense_hits),
+            SimpleNamespace(points=sparse_hits)
+        ]
 
         query_emb = np.zeros(384)
         results = svc.hybrid_search("XT-500", query_emb, top_k=1)
@@ -188,7 +194,10 @@ class TestQdrantServiceHybridSearch:
         dense_hits = [_make_hit(f"doc{i}", text=f"chunk {i}") for i in range(10)]
         sparse_hits = [_make_hit(f"doc{i+5}", text=f"chunk {i+5}") for i in range(10)]
 
-        svc._client.search.side_effect = [dense_hits, sparse_hits]
+        svc._client.query_points.side_effect = [
+            SimpleNamespace(points=dense_hits),
+            SimpleNamespace(points=sparse_hits)
+        ]
 
         results = svc.hybrid_search("something", np.zeros(384), top_k=3)
         assert len(results) <= 3
@@ -204,7 +213,10 @@ class TestQdrantServiceHybridSearch:
         dense_hits = [_make_hit("a", text="doc a"), _make_hit("b", text="doc b")]
         sparse_hits = [_make_hit("b", text="doc b"), _make_hit("c", text="doc c")]
 
-        svc._client.search.side_effect = [dense_hits, sparse_hits]
+        svc._client.query_points.side_effect = [
+            SimpleNamespace(points=dense_hits),
+            SimpleNamespace(points=sparse_hits)
+        ]
 
         results = svc.hybrid_search("hello", np.zeros(384), top_k=5)
         for r in results:
@@ -234,7 +246,10 @@ class TestQdrantServiceHybridSearch:
             _make_hit("doc_b", text="in both lists"),   # rank 1 sparse
         ]
 
-        svc._client.search.side_effect = [dense_hits, sparse_hits]
+        svc._client.query_points.side_effect = [
+            SimpleNamespace(points=dense_hits),
+            SimpleNamespace(points=sparse_hits)
+        ]
 
         results = svc.hybrid_search("query", np.zeros(384), top_k=2)
         assert results[0]["text"] == "in both lists", (
