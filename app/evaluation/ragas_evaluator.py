@@ -24,13 +24,13 @@ from __future__ import annotations
 import os
 os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
+import re
 import asyncio
 import logging
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-import re
 
 
 def _strip_citations(answer: str) -> str:

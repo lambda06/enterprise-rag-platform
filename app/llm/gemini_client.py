@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import base64
+import logging
+from typing import Iterable, List
+
+from google import genai
+from google.genai import types
+
+from app.core.config import get_settings
+
 """
 Gemini 2.0 Flash LLM client — primary generation provider.
 
@@ -25,16 +35,6 @@ then concatenating the captions loses that cross-modal coherence, and
 adds N−1 extra API round-trips (latency × N).  The single-multimodal-call
 approach is both faster and produces more coherent, grounded answers.
 """
-
-import asyncio
-import base64
-import logging
-from typing import Iterable, List
-
-from google import genai
-from google.genai import types
-
-from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 

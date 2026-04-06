@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+from typing import Dict, Iterable, List
+
+from groq import Groq
+
+from app.core.config import get_settings
+
 """
 Groq LLM client — FALLBACK provider.
 
@@ -15,13 +22,6 @@ async `GroqLLMService.generate_text_response` method which calls
 are executed in a thread via `asyncio.to_thread` so the API can be used
 from FastAPI endpoints safely.
 """
-
-import asyncio
-from typing import Dict, Iterable, List
-
-from groq import Groq
-
-from app.core.config import get_settings
 
 
 # System prompt: instructs the model to only use the provided context

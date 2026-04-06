@@ -355,7 +355,6 @@ async def llm_node(state: AgentState) -> dict[str, Any]:
         for c in chunks
     )
 
-    session_id = state.get("session_id", "")
     if chunks:
         # A/B test concluded — Variant A (version 1) won on answer_relevancy
         # and faithfulness. All traffic now uses version 1 directly.
