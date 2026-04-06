@@ -1,0 +1,78 @@
+# =============================================================================
+# docker-compose.yml — Local development stack
+#
+# Services:
+#   api     — the FastAPI application (built from Dockerfile at repo root)
+#   qdrant  — local Qdrant vector DB for offline development
+#
+# Usage:
+#   docker compose -f docker/compose/docker-compose.yml up --build
+#
+# To use Qdrant Cloud instead of local Qdrant:
+#   1. Comment out the `qdrant` service below
+#   2. In .env, set QDRANT_URL=https://your-cluster.region.gcp.cloud.qdrant.io
+#      and QDRANT_API_KEY=<your_key>
+# =============================================================================
+
+services:
+
+  # ── FastAPI Application ─────────────────────────────────────────────────────
+  api:
+    build:
+      context: ..        # repo root (where .dockerignore lives)
+      dockerfile: docker/Dockerfile
+    container_name: enterprise-rag-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../.env          # loads all secrets from your local .env file
+    environment:
+      # Override Qdrant URL to point at the local qdrant container.
+      # Comment this out if using Qdrant Cloud.
+      QDRANT_URL: "http://qdrant:6333"
+      QDRANT_API_KEY: ""    # no key needed for local Qdrant
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Streamlit Frontend ──────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ..        # repo root
+      dockerfile: docker/Dockerfile.streamlit
+      args:
+        BACKEND_URL: "http://api:8000"
+    container_name: enterprise-rag-frontend
+    ports:
+      - "8501:7860"      # Exposed on 8501, running internally on 7860
+    env_file:
+      - ../.env
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── Qdrant Vector Database (local dev only) ─────────────────────────────────
+  # Not needed in production — use Qdrant Cloud instead.
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: enterprise-rag-qdrant
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+
+# ── Volumes ──────────────────────────────────────────────────────────────────
+volumes:
+  qdrant_data:
+    driver: local
+    # Qdrant collection data persists across container restarts.
+    # To reset: docker compose down -v

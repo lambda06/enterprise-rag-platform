@@ -31,7 +31,7 @@ Phase 1 ✅  RAG Core         — PDF ingestion · vector search · FastAPI back
 Phase 2 ✅  Optimization     — Hybrid search · Cross-encoder reranking · RAGAS evaluation
 Phase 3 ✅  Agentic Layer    — LangGraph agent · Intelligent routing · Conversation memory
 Phase 4 ✅  Multimodal       — Images · Tables · Gemini 2.0 Flash
-Phase 5 🔜  MLOps            — Langfuse observability · Prompt versioning (groundwork laid)
+Phase 5 ✅  MLOps            — Langfuse observability · Token tracking · Prompt versioning · A/B testing · RAGAS pipeline
 Phase 6 🔜  Deployment       — Docker · CI/CD · Live on cloud
 ```
 
@@ -201,15 +201,59 @@ negatives produced zero improvement across 3 experiments.
 
 ---
 
-## 📊 Phase 5 — MLOps *(planned — groundwork laid)*
+## 📊 Phase 5 — MLOps ✅
 
-**Goal:** Full observability, prompt versioning, and automated evaluation pipelines.
+**Goal:** Full observability pipeline, prompt versioning, data-driven A/B testing, and automated evaluation — all without blocking the serving path.
 
-> **Note:** Langfuse tracing (`app/observability/langfuse_tracer.py`) and RAGAS evaluation are already integrated and operational. This phase focuses on maturing those integrations with dashboards, alert thresholds, and prompt registry.
+### What was built
 
-- Langfuse dashboard: latency percentiles, RAGAS score trends, cost tracking
-- Prompt versioning and A/B testing via Langfuse prompt registry
-- Offline batch evaluation scripts for regression testing
+- **Granular Langfuse Token Observability** (`app/agents/nodes/llm_node.py`) — Every RAG request now captures per-stage token metrics via Gemini's `response.usage_metadata`: `input_tokens`, `output_tokens`, `total_tokens`. Two proxy metrics are also recorded — `context_chars` (total characters across all retrieved chunks) and `question_chars` (user question length). The ratio `context_chars / question_chars > 10:1` flags oversized chunks. All data surfaces in Langfuse as span output on the `llm-generation` span.
+
+- **Prompt Registry** (`app/core/prompt_registry.py`) — Central `PromptRegistry` class with a 5-minute TTL in-process cache, Langfuse as the source of truth (fetched by `label="production"`), and hardcoded fallback prompts for every key. The same `session_id` always resolves to the same variant (session-stable), so users never flip mid-conversation. Cache is explicitly invalidatable per prompt name.
+
+- **A/B Testing Infrastructure** (`app/core/prompt_registry.py` · `app/agents/nodes/llm_node.py`) — `get_ab_variant()` MD5-hashes the `session_id` and maps the first hex digit to a 50/50 split between Langfuse prompt version A and B. The resolved `prompt_variant` (`"A"` or `"B"`), `prompt_version`, and `prompt_source` are written to every `llm-generation` Langfuse span for downstream analysis.
+
+- **Batch Evaluation Script** (`scripts/eval/batch_eval.py`) — Standalone CLI that reads a JSON file of Q/A/context triples, scores them with RAGAS, writes timestamped results JSON, and prints aggregate means. Designed to run nightly or post-deploy without touching the serving path. Supports pluggable metric sets via `--metrics` flag.
+
+- **A/B Analysis Script** (`scripts/ab_test_analysis.py`) — Fetches the N most recent Langfuse traces that carry both RAGAS scores and variant tags, buckets them by variant, and prints a side-by-side metric table with a winner per metric and an actionable recommendation. `--verbose` flag shows per-trace timestamp, variant, question snippet, and individual scores. `--since` filter passes `from_timestamp` directly to the Langfuse API so the page budget isn't wasted on old history.
+
+- **Controlled A/B Query Runner** (`scripts/run_ab_test_queries.py`) — Sends each evaluation question through **both** Variant A and Variant B (paired, not alternating) to control for question difficulty. Uses brute-forced UUIDs that hash to the target variant via the same MD5 logic as the router. 10 domain-specific, document-bound questions across 5 types (factual, comparative, definitional, procedural, analytical). Paces requests at 30 s intervals to respect Groq's free-tier token-per-minute limit.
+
+### A/B Test: Prompt v1 vs Prompt v2 — Final Results
+
+Two RAG system prompts were tested over 20 controlled query pairs:
+
+| Metric | Variant A (v1) | Variant B (v2) | Winner |
+|---|---|---|---|
+| `answer_relevancy` | 0.597 | 0.542 | **A** |
+| `faithfulness` | 0.775 | 0.667 | **A** |
+| `llm_context_precision_without_reference` | 0.584 | 0.652 | B |
+
+**Conclusion:** Variant A (the original production prompt) retained its lead. Variant B's "echo phrasing" rule (Rule 2: *"directly answer in the first sentence using the question's own phrasing"*) caused the model to refuse more often on coverage-gap questions — each refusal scores `faithfulness=0` and `relevancy=0` in RAGAS, pulling the mean down significantly. Variant A's more permissive style produces partial hedged answers that RAGAS still scores positively. Variant B won when both prompts answered, but the higher refusal rate was decisive. **Variant A promoted to 100% traffic.**
+
+### 🐛 Issues Encountered & Resolutions
+
+**Issue 1: `answer_relevancy` scoring 0.17 despite correct answers**
+- **Where:** `app/evaluation/ragas_evaluator.py`
+- **Cause:** RAGAS `ResponseRelevancy` reverse-engineers the original question from the answer text. Both prompts instructed the model to cite sources inline as `[Context 1]`, `[Context 2]`, etc. The reverse-question LLM received noise tokens and generated questions like *"What does Context 1 say?"* — which has near-zero cosine similarity to the actual user question. The metric was measuring citation format, not answer quality.
+- **Fix:** Added `_strip_citations()` — a regex pre-processor that removes `[Context N]` markers from the `response` field before building `SingleTurnSample`. Applied only to `ResponseRelevancy`'s input; faithfulness and context precision receive the original answer with citations intact.
+
+**Issue 2: Groq rate limits corrupting RAGAS evaluations mid-run**
+- **Where:** `app/evaluation/ragas_evaluator.py`
+- **Cause:** RAGAS makes 5–8 sequential LLM calls per evaluation (reverse question generation, claim decomposition, etc.). Using `llama-3.3-70b-versatile` — the same model as the main RAG pipeline — exhausted Groq's free-tier tokens-per-minute quota mid-evaluation. Symptoms were: completely empty scores on some traces, partial scores (only 1 of 3 metrics) on others, and suspiciously low `answer_relevancy` values of 0.05–0.07 on back-to-back queries.
+- **Fix:** Introduced a dedicated evaluation model constant `_RAGAS_EVAL_MODEL`, defaulting to `llama-3.1-8b-instant` — a separate Groq model with ~5× higher tokens-per-minute headroom. RAGAS only needs strong instruction-following capability for its prompts; a 70B model is overkill. Overridable via `RAGAS_EVAL_MODEL` env var without code changes. The main RAG pipeline continues using `llama-3.3-70b-versatile` (via `settings.groq.model`) unaffected.
+
+**Issue 3: A/B analysis script pulling old/contaminated traces**
+- **Where:** `scripts/ab_test_analysis.py`
+- **Cause:** The script fetched the 100 most recent Langfuse traces and collected the first 20 valid ones — but with `limit=100` and no time filter, pre-fix traces (with the 0.17 scores) dominated the results. After a code fix, the next run would still show the old numbers because old traces ranked higher.
+- **Fix 1:** Added `--since` flag that passes `from_timestamp` directly to `lf.client.trace.list()` — the Langfuse API filters server-side so the page budget is spent only on post-cutoff traces. Client-side guard retained as belt-and-suspenders.
+- **Fix 2:** Added `--verbose` flag that prints each trace's timestamp, variant, and per-metric scores alongside the question text (extracted from `trace.input`), so contaminated traces are immediately visible.
+- **Fix 3:** Metric key lookup now checks both `"response_relevancy"` and `"answer_relevancy"` (RAGAS renamed the field between versions) so no scores are silently missed.
+
+**Issue 4: Half the test queries routed away from RAG (non_rag_routing)**
+- **Where:** `scripts/run_ab_test_queries.py` — initial question set
+- **Cause:** Questions like *"What is retrieval augmented generation?"* and *"What are the trade-offs between fine-tuning the retriever vs generator?"* were correctly classified by the router as general-knowledge questions — no RAG needed. They were answered by the direct LLM path without document retrieval, which means no RAGAS evaluation ran. 10 of 20 queries produced no eval scores.
+- **Fix:** Rewrote all 10 questions to be explicitly document-bound using anchors like *"according to the study"*, *"the paper describes"*, *"in its results section"*. These phrasings signal to the router that the answer requires a specific document, guaranteeing RAG routing and evaluation coverage.
 
 ---
 

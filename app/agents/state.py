@@ -140,6 +140,13 @@ class AgentState(dict):
     consumed by the GENERATOR node to build the LLM context window.
     """
 
+    image_b64_list: list[str]
+    """
+    List of base64 encoded images extracted from multimodal chunks.
+    Populated by the RAG_RETRIEVAL node; consumed by the GENERATOR (LLM) node
+    to provide vision context alongside text.
+    """
+
     # ------------------------------------------------------------------ #
     # Generation stage                                                    #
     # ------------------------------------------------------------------ #

@@ -56,7 +56,6 @@ class GeminiSettings(BaseSettings):
         description="Gemini generation model ID (text + multimodal)",
     )
 
-
 class GroqSettings(BaseSettings):
     """Groq LLM API configuration."""
 
@@ -69,6 +68,11 @@ class GroqSettings(BaseSettings):
 
     api_key: str = Field(default="", description="Groq API key")
     model: str = Field(default="llama-3.3-70b-versatile", description="Default model name")
+    ragas_eval_model: str = Field(
+        default="llama-3.1-8b-instant",
+        validation_alias="RAGAS_EVAL_MODEL",
+        description="Dedicated RAGAS evaluation model",
+    )
 
 
 class QdrantSettings(BaseSettings):
@@ -137,21 +141,21 @@ class LangfuseSettings(BaseSettings):
     host: str = Field(default="https://cloud.langfuse.com", description="Langfuse host URL")
 
 
-class HuggingFaceSettings(BaseSettings):
-    """Hugging Face models configuration."""
+class JinaSettings(BaseSettings):
+    """Jina Rerank API configuration."""
 
     model_config = SettingsConfigDict(
+        env_prefix="JINA_",
         env_file=_PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
-    token: str = Field(default="", validation_alias="HUGGINGFACE_TOKEN")
+    api_key: str = Field(default="", description="Jina API key")
     reranker_model: str = Field(
-        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
-        validation_alias="RERANKER_MODEL",
+        default="jina-reranker-v2-base-multilingual", 
+        description="Jina reranker model ID"
     )
-
 
 class Settings(BaseSettings):
     """Root settings aggregating all configuration groups."""
@@ -169,7 +173,7 @@ class Settings(BaseSettings):
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)
-    huggingface: HuggingFaceSettings = Field(default_factory=HuggingFaceSettings)
+    jina: JinaSettings = Field(default_factory=JinaSettings)
 
     # LLM provider selection — set LLM_PROVIDER=groq to use Groq as fallback
     llm_provider: str = Field(
@@ -177,7 +181,6 @@ class Settings(BaseSettings):
         validation_alias="LLM_PROVIDER",
         description="Active LLM provider: 'gemini' (default) or 'groq' (fallback)",
     )
-
 
 @lru_cache
 def get_settings() -> Settings:

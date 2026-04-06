@@ -1,0 +1,57 @@
+# =============================================================================
+# .dockerignore — Files excluded from the Docker build context
+#
+# A lean build context speeds up `docker build` and prevents secrets from
+# accidentally being baked into the image.
+# =============================================================================
+
+# Python virtual environment (we install a fresh one inside the image)
+venv_312/
+.venv/
+venv/
+
+# Secret — NEVER bake actual credentials into the image
+.env
+
+# Python byte-code caches (not needed in the image)
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Git internals
+.git/
+.gitignore
+.github/
+
+# Development tooling
+.vscode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs — not needed at build time
+logs/
+
+# Local data files and sample PDFs — not needed in the image
+data/
+sample.pdf
+sample_multi.pdf
+*.http
+tempCodeRunnerFile.python
+
+# Notebooks — not part of the application
+notebooks/
+
+# Test suite — not needed in production image
+tests/
+
+# Documentation — not needed in the image
+docs/
+
+# Docker compose files themselves (not needed inside the image)
+# Note: we need the docker folder to include entrypoint.sh, so we do not exclude it!
+
+# Models directory (fine-tuned model weights if present — large files)
+# If you add a fine-tuned reranker, mount it as a volume instead.
+models/

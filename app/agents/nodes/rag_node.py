@@ -110,10 +110,11 @@ async def rag_node(state: AgentState, top_k: int = DEFAULT_TOP_K) -> dict[str, A
             top_k,
         )
 
-        # retrieve_staged returns (raw_candidates, reranked):
+        # retrieve_with_vision returns (raw_candidates, reranked, image_b64_list):
         #   raw_candidates — all hybrid-search hits (top_k * RERANK_FACTOR)
         #   reranked       — final top_k after cross-encoder scoring
-        raw_candidates, reranked = await retrieval_service.retrieve_staged(
+        #   image_b64_list — base64 strings of extracted images
+        raw_candidates, reranked, image_b64_list = await retrieval_service.retrieve_with_vision(
             query=question,
             top_k=top_k,
         )
@@ -141,7 +142,7 @@ async def rag_node(state: AgentState, top_k: int = DEFAULT_TOP_K) -> dict[str, A
         msg = f"rag_node retrieval failed: {exc}"
         logger.exception(msg)
         tracer.end_span(retrieval_span, output={"error": msg})
-        return {"retrieved_chunks": [], "reranked_chunks": [], "error": msg}
+        return {"retrieved_chunks": [], "reranked_chunks": [], "image_b64_list": [], "error": msg}
 
     # ------------------------------------------------------------------ #
     # Span 2: reranking (cross-encoder)                                  #
@@ -166,19 +167,15 @@ async def rag_node(state: AgentState, top_k: int = DEFAULT_TOP_K) -> dict[str, A
     # when scores aren't directly accessible, and rely on chunks_dropped instead.
     chunks_dropped = len(raw_candidates) - len(reranked)
 
-    # Compute top reranker score from raw candidate pairs if reranker is active.
+    # The Jina API currently does not expose the scores after reranking
+    # in the public interface. We log None for top_reranker_score.
     top_reranker_score: float | None = None
-    if reranker_service.model is not None and raw_candidates:
-        import numpy as np
-        pairs = [(question, c.get("text", "")) for c in raw_candidates[:1]]
-        scores = reranker_service.model.predict(pairs, show_progress_bar=False)
-        top_reranker_score = round(float(np.max(scores)), 4)
 
     tracer.end_span(
         reranking_span,
         output={
-            # "finetuned" or "base" — confirms which cross-encoder is active.
-            "model_source":       reranker_service.model_source or "unavailable",
+            # Confirms which cross-encoder model was used (e.g. from Jina API).
+            "model_source":       getattr(reranker_service, "_model", "unavailable") if getattr(reranker_service, "_available", False) else "unavailable",
             "chunks_out":         len(reranked),
             # High chunks_dropped is normal — aggressive reranker filtering.
             "chunks_dropped":     chunks_dropped,
@@ -195,7 +192,7 @@ async def rag_node(state: AgentState, top_k: int = DEFAULT_TOP_K) -> dict[str, A
         len(raw_candidates),
         len(reranked),
         chunks_dropped,
-        reranker_service.model_source,
+        getattr(reranker_service, "_model", "unavailable") if getattr(reranker_service, "_available", False) else "unavailable",
         question[:80],
     )
 
@@ -209,5 +206,6 @@ async def rag_node(state: AgentState, top_k: int = DEFAULT_TOP_K) -> dict[str, A
     return {
         "retrieved_chunks": raw_candidates,
         "reranked_chunks":  reranked,
+        "image_b64_list":   image_b64_list,
         "error":            "",
     }

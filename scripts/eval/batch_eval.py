@@ -47,6 +47,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -84,6 +85,26 @@ DEFAULT_METRICS = [
 ]
 
 
+def _strip_citations(answer: str) -> str:
+    """Remove [Context N] citation tags from an answer before RAGAS evaluation.
+
+    ``ResponseRelevancy`` reverse-generates a question from the answer text and
+    measures cosine similarity against the original question.  Inline citation
+    markers such as ``[Context 1]`` cause the reverse-question LLM to produce
+    off-topic questions ("What does Context 1 say?"), collapsing the metric
+    to ~0.17 even when the answer is correct.
+
+    Applied only to the ``response`` field of ``SingleTurnSample``.
+    Faithfulness and ContextPrecision are unaffected because they score
+    grounding from the retrieved contexts, not answer phrasing.
+    """
+    cleaned = re.sub(r'\[Context\s+\d+\]', '', answer)
+    cleaned = re.sub(r'According to\s*,\s*', '', cleaned)
+    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    cleaned = re.sub(r',\s*\.', '.', cleaned)
+    return cleaned.strip()
+
+
 def _load_metric(name: str):
     """Dynamically import and instantiate a RAGAS metric by name."""
     import importlib
@@ -99,7 +120,8 @@ def _build_evaluator_llm():
     from ragas.llms import LangchainLLMWrapper
 
     api_key = os.environ.get("GROQ_API_KEY", "")
-    model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+    # Dedicated eval model — separate from the main RAG model so rate limits
+    model = os.environ.get("RAGAS_EVAL_MODEL", "llama-3.1-8b-instant")
 
     if not api_key:
         logger.error(
@@ -107,6 +129,7 @@ def _build_evaluator_llm():
         )
         sys.exit(1)
 
+    logger.info("RAGAS evaluator LLM: %s", model)
     return LangchainLLMWrapper(ChatGroq(api_key=api_key, model=model, temperature=0.0))
 
 
@@ -144,7 +167,10 @@ def run_batch_eval(
         ragas_samples.append(
             SingleTurnSample(
                 user_input=s["question"],
-                response=s["answer"],
+                # Strip [Context N] tags so ResponseRelevancy is not confused
+                # by citation markers during reverse-question generation.
+                # See _strip_citations() for the full rationale.
+                response=_strip_citations(s["answer"]),
                 # contexts must be a list of str; guard against missing key
                 retrieved_contexts=s.get("contexts", []),
                 # reference is optional; include if provided (enables recall)

@@ -4,12 +4,21 @@ FastAPI application entry point for the Enterprise RAG Platform.
 
 from contextlib import asynccontextmanager
 
+import logging
+import sys
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.chat import router as chat_router
 from app.api.routes.documents import router as documents_router
 
+# Configure base logging to output everything INFO and above to the terminal
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)-9s %(name)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

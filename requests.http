@@ -38,10 +38,10 @@ POST {{baseUrl}}/api/v1/documents/upload
 Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
 
 ------WebKitFormBoundary7MA4YWxkTrZu0gW
-Content-Disposition: form-data; name="file"; filename="sample_multi.pdf"
+Content-Disposition: form-data; name="file"; filename="sample.pdf"
 Content-Type: application/pdf
 
-< ./sample_multi.pdf
+< ./sample.pdf
 ------WebKitFormBoundary7MA4YWxkTrZu0gW--
 
 ###
@@ -147,7 +147,7 @@ POST {{baseUrl}}/api/v1/chat
 Content-Type: application/json
 
 {
-  "question": "What is vector database according to document?",
+  "question": "What is LLM according to the document?",
   "session_id": "{{session}}"
 }
 
@@ -210,7 +210,7 @@ POST {{baseUrl}}/api/v1/chat?evaluate=true
 Content-Type: application/json
 
 {
-  "question": "What is API based on the provided document?",
+  "question": "What is rag according to the document?",
   "session_id": "{{session}}"
 }
 

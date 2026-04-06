@@ -31,6 +31,14 @@ Output
 The node always writes ``final_answer`` (str) to the returned state dict.
 An empty ``error`` string indicates success; a non-empty value signals that
 the OUTPUT node's conditional edge should route to the ERROR node.
+
+Prompts
+-------
+System prompts and canned refusals are loaded from the Langfuse-backed registry
+at runtime (``prompt_registry``), so they can be updated without redeploying.
+The RAG path uses ``get_ab_variant`` for session-stable A/B tests. Resolved
+prompt version, source, and variant (when applicable) are recorded on the
+``llm-generation`` Langfuse span for every trace.
 """
 
 from __future__ import annotations
@@ -40,16 +48,17 @@ import logging
 from typing import Any
 
 from app.agents.state import AgentState
+from app.core.prompt_registry import prompt_registry
 from app.llm.gemini_client import gemini_llm_service
 from app.observability.langfuse_tracer import tracer
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Module-level prompt constants
+# Reference copies — DEPRECATED - now managed via Langfuse prompt registry
 # ---------------------------------------------------------------------------
-
-# Path 1 — RAG system prompt
+#
+# Path 1 — RAG system prompt (rag-answer-generation)
 #
 # Design decisions:
 #   • "ONLY the context blocks below" is emphasised to minimise hallucination.
@@ -59,20 +68,22 @@ logger = logging.getLogger(__name__)
 #     an answer when the relevant information is absent from the retrieved chunks.
 #   • We do NOT tell the model its general knowledge — keeping it fully grounded
 #     is a deliberate tradeoff for factual accuracy over completeness.
-RAG_SYSTEM_PROMPT = """\
-You are a precise document assistant.  Your answers must be grounded EXCLUSIVELY \
-in the context blocks provided below.  Do NOT use any external or general knowledge.
-
-Rules:
-  1. Read ALL context blocks before answering.
-  2. Cite the source of each claim using [Context N] inline (e.g. "According to [Context 1], ...").
-  3. If the answer is not contained in any context block, respond with:
-     "I don't know based on the provided documents."
-  4. Do NOT speculate, infer beyond what is stated, or add information from outside the context.
-  5. Be concise and direct.  Prefer bullet points for multi-part answers.\
-"""
-
-# Path 2 — Direct answer system prompt
+#
+# # RAG_SYSTEM_PROMPT
+# """\
+# You are a precise document assistant.  Your answers must be grounded EXCLUSIVELY \
+# in the context blocks provided below.  Do NOT use any external or general knowledge.
+#
+# Rules:
+#   1. Read ALL context blocks before answering.
+#   2. Cite the source of each claim using [Context N] inline (e.g. "According to [Context 1], ...").
+#   3. If the answer is not contained in any context block, respond with:
+#      "I don't know based on the provided documents."
+#   4. Do NOT speculate, infer beyond what is stated, or add information from outside the context.
+#   5. Be concise and direct.  Prefer bullet points for multi-part answers.\
+# """
+#
+# Path 2 — Direct answer system prompt (direct-answer-generation)
 #
 # Design decisions:
 #   • Explicitly states "general knowledge" so the model doesn't assume it
@@ -81,13 +92,15 @@ Rules:
 #     RAG grounding constraint — the model may draw on its parametric memory.
 #   • Honesty clause ("say so clearly") mirrors the RAG "I don't know" clause,
 #     maintaining a trustworthy user experience across both paths.
-DIRECT_SYSTEM_PROMPT = """\
-You are a knowledgeable and helpful assistant.  Answer the user's question \
-from your general knowledge.  Be accurate, concise, and honest.  \
-If you are unsure about something, say so clearly rather than guessing.\
-"""
-
-# Path 3 — Out-of-scope refusal (no LLM call; returned verbatim)
+#
+# # DIRECT_SYSTEM_PROMPT
+# """\
+# You are a knowledgeable and helpful assistant.  Answer the user's question \
+# from your general knowledge.  Be accurate, concise, and honest.  \
+# If you are unsure about something, say so clearly rather than guessing.\
+# """
+#
+# Path 3 — Out-of-scope refusal (out-of-scope-refusal; no LLM call)
 #
 # Design decisions:
 #   • Phrased politely and non-judgementally to avoid embarrassing users who
@@ -95,11 +108,13 @@ If you are unsure about something, say so clearly rather than guessing.\
 #   • Does NOT explain *why* the request is out of scope — doing so can
 #     inadvertently teach users how to rephrase harmful prompts.
 #   • Offers to help with something else to keep the interaction positive.
-OUT_OF_SCOPE_REFUSAL = (
-    "I'm sorry, but I'm not able to help with that request. "
-    "I'm designed to assist with document-related questions and general knowledge queries. "
-    "Is there something else I can help you with?"
-)
+#
+# # OUT_OF_SCOPE_REFUSAL
+# (
+#     "I'm sorry, but I'm not able to help with that request. "
+#     "I'm designed to assist with document-related questions and general knowledge queries. "
+#     "Is there something else I can help you with?"
+# )
 
 # Maximum tokens for the generated answer.
 # 1024 is a reasonable ceiling for enterprise Q&A: long enough for detailed
@@ -147,6 +162,8 @@ def _build_rag_context(question: str, chunks: list[dict[str, Any]]) -> tuple[lis
 def _call_gemini_rag_sync(
     question: str,
     chunks: list[dict[str, Any]],
+    system_instruction: str,
+    image_b64_list: list[str] | None = None,
 ) -> tuple[str, dict[str, int]]:
     """
     Blocking Gemini call for RAG path — returns (answer, usage).
@@ -159,7 +176,7 @@ def _call_gemini_rag_sync(
 
     # Override system instruction for RAG grounding
     config = gtypes.GenerateContentConfig(
-        system_instruction=RAG_SYSTEM_PROMPT,
+        system_instruction=system_instruction,
         temperature=0.0,
         max_output_tokens=MAX_ANSWER_TOKENS,
     )
@@ -175,31 +192,45 @@ def _call_gemini_rag_sync(
         page = meta.get("page") or meta.get("page_number")
         source_label = f"{source}, page {page}" if page else source
         parts.append(f"[Context {i}] (Source: {source_label})\n{text}")
-    parts.append(f"Question: {question}")
+    
     prompt = "\n\n".join(parts)
+    contents: list[Any] = [prompt]
+
+    if image_b64_list:
+        import base64
+        for idx, b64_str in enumerate(image_b64_list):
+            try:
+                image_bytes = base64.b64decode(b64_str)
+                contents.append(
+                    gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png")
+                )
+            except Exception as exc:
+                logger.warning("Skipping image %d in llm_node — decode error: %s", idx + 1, exc)
+
+    contents.append(f"\n\nQuestion: {question}")
 
     from app.llm.gemini_client import gemini_llm_service as svc
     response = svc._client.models.generate_content(  # noqa: SLF001
         model=svc._model_name,  # noqa: SLF001
-        contents=prompt,
+        contents=contents,
         config=config,
     )
     usage = svc._parse_usage(getattr(response, "usage_metadata", None))  # noqa: SLF001
     return response.text or "", usage
 
 
-def _call_gemini_direct_sync(question: str) -> tuple[str, dict[str, int]]:
+def _call_gemini_direct_sync(question: str, system_instruction: str) -> tuple[str, dict[str, int]]:
     """
     Blocking Gemini call for direct (no-retrieval) path — returns (answer, usage).
 
-    Uses the DIRECT_SYSTEM_PROMPT so the model knows it may use parametric
-    knowledge rather than being restricted to context blocks.
+    ``system_instruction`` comes from the registry (direct-answer-generation)
+    so the model may use parametric knowledge rather than context blocks.
     """
     from google.genai import types as gtypes
     from app.llm.gemini_client import gemini_llm_service as svc
 
     config = gtypes.GenerateContentConfig(
-        system_instruction=DIRECT_SYSTEM_PROMPT,
+        system_instruction=system_instruction,
         temperature=0.0,
         max_output_tokens=MAX_ANSWER_TOKENS,
     )
@@ -286,8 +317,9 @@ async def llm_node(state: AgentState) -> dict[str, Any]:
     # ------------------------------------------------------------------ #
     if routing_decision == "out_of_scope":
         logger.info("llm_node: out_of_scope — returning polite refusal without LLM call.")
+        refusal = prompt_registry.get_prompt("out-of-scope-refusal")
         return {
-            "final_answer": OUT_OF_SCOPE_REFUSAL,
+            "final_answer": refusal.text,
             "token_usage": {},
             "error": "",
         }
@@ -323,6 +355,14 @@ async def llm_node(state: AgentState) -> dict[str, Any]:
         for c in chunks
     )
 
+    session_id = state.get("session_id", "")
+    if chunks:
+        # A/B test concluded — Variant A (version 1) won on answer_relevancy
+        # and faithfulness. All traffic now uses version 1 directly.
+        prompt_res = prompt_registry.get_prompt("rag-answer-generation", version=1)
+    else:
+        prompt_res = prompt_registry.get_prompt("direct-answer-generation")
+
     # Open the llm-generation span BEFORE the Gemini call so latency is captured.
     llm_span = tracer.start_generation(
         lf_trace,
@@ -338,18 +378,25 @@ async def llm_node(state: AgentState) -> dict[str, Any]:
             "content_types_in_context": content_types_in_context,
             "multimodal_used":         multimodal_used,
         },
+        metadata={
+            "prompt_version": prompt_res.version,
+            "prompt_source": prompt_res.source,
+            "prompt_variant": prompt_res.variant,
+        },
     )
 
     try:
         if chunks:
             # ── Path 1: RAG-grounded answer ──────────────────────────────
+            image_b64_list = state.get("image_b64_list") or []
             logger.info(
-                "llm_node: RAG path (Gemini) — %d context chunks for question=%r",
+                "llm_node: RAG path (Gemini) — %d context chunks + %d image(s) for question=%r",
                 len(chunks),
+                len(image_b64_list),
                 question[:80],
             )
             answer, usage = await asyncio.to_thread(
-                _call_gemini_rag_sync, question, chunks
+                _call_gemini_rag_sync, question, chunks, prompt_res.text, image_b64_list
             )
 
         else:
@@ -359,7 +406,7 @@ async def llm_node(state: AgentState) -> dict[str, Any]:
                 question[:80],
             )
             answer, usage = await asyncio.to_thread(
-                _call_gemini_direct_sync, question
+                _call_gemini_direct_sync, question, prompt_res.text
             )
 
         # ── Assemble token metadata ──────────────────────────────────────

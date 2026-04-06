@@ -4,7 +4,7 @@ Retrieval service for the Enterprise RAG Platform.
 Two-stage retrieval pipeline:
   1. **Hybrid search** (dense cosine + sparse BM25, fused with RRF)
      Casts a wide net of ``top_k * RERANK_FACTOR`` candidate chunks cheaply.
-  2. **Cross-encoder reranking** (ms-marco-MiniLM-L-6-v2)
+  2. **Cross-encoder reranking** (Jina Rerank API)
      Scores each (query, chunk) pair jointly so token-level interactions can
      be modelled — then returns only the best ``top_k`` chunks.
 
@@ -13,16 +13,16 @@ The public interface (``retrieve(query, top_k)``) is unchanged, so
 
 Threading notes
 ---------------
-Both ``sentence_transformers.CrossEncoder.predict`` and
-``QdrantService.hybrid_search`` are synchronous.  All blocking calls are
-dispatched to a thread pool via ``asyncio.to_thread`` to keep the FastAPI
-event loop free.
+``QdrantService.hybrid_search`` is synchronous.  The Jina Rerank HTTP call in
+``RerankerService.rerank()`` is also synchronous (httpx blocking mode).
+All blocking calls are dispatched to a thread pool via ``asyncio.to_thread``
+to keep the FastAPI event loop free.
 
-Model loading
--------------
-``CrossEncoder`` is loaded once at module import time as a singleton
-(``_reranker``).  Loading takes ~1 s the first time; subsequent requests pay
-zero overhead.  Download is ~24 MB and is cached by HuggingFace Hub.
+Reranker
+--------
+Reranking is performed by the Jina Rerank API (jina-reranker-v2-base-multilingual).
+Set ``JINA_API_KEY`` in the environment to enable it.  If the key is absent or
+the API is unreachable, ``rerank()`` degrades gracefully to RRF score order.
 """
 
 from __future__ import annotations

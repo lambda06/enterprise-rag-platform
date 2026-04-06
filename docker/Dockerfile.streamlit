@@ -1,0 +1,21 @@
+FROM python:3.12-slim
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements and install dependencies
+COPY requirements_streamlit.txt .
+RUN pip install --no-cache-dir -r requirements_streamlit.txt
+
+# Copy only the streamlit_app directory
+COPY streamlit_app/ ./streamlit_app/
+
+# Expose port as requested
+EXPOSE 8501
+
+# Set BACKEND_URL as a build arg with a default pointing to a Render FastAPI service URL
+ARG BACKEND_URL=https://enterprise-rag-platform.onrender.com
+ENV BACKEND_URL=$BACKEND_URL
+
+# Run streamlit on port 7860 with server, headless mode enabled, and CORS disabled
+CMD ["streamlit", "run", "streamlit_app/app.py", "--server.port=7860", "--server.headless=true", "--server.enableCORS=false"]

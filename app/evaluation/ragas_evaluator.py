@@ -30,6 +30,37 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+import re
+
+
+def _strip_citations(answer: str) -> str:
+    """Remove [Context N] citation tags before feeding the answer to RAGAS.
+
+    RAGAS ``ResponseRelevancy`` works by asking an LLM to reverse-engineer
+    the original question from the answer text, then measuring cosine
+    similarity between that generated question and the real question.
+
+    When the answer contains inline citations such as ``[Context 1]`` or
+    ``According to [Context 2], ...``, the reverse-question LLM generates
+    questions like *"What does Context 1 say?"* instead of topically
+    specific questions.  That tanked similarity to the real question and
+    produces artificially low scores (~0.17).
+
+    This function strips those tags so the semantic content of the answer
+    is evaluated cleanly.  It is ONLY applied to the ``response`` field
+    passed to RAGAS — the original answer (with citations) is still used
+    for downstream logging and for Faithfulness / ContextPrecision, which
+    measure grounding rather than topical relevance.
+    """
+    # Remove bare tags: [Context 1], [Context 2], …
+    cleaned = re.sub(r'\[Context\s+\d+\]', '', answer)
+    # Remove leading "According to ," artefacts left after tag removal
+    cleaned = re.sub(r'According to\s*,\s*', '', cleaned)
+    # Collapse double spaces and fix orphaned punctuation
+    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    cleaned = re.sub(r',\s*\.', '.', cleaned)
+    return cleaned.strip()
+
 
 def _build_evaluator_llm():
     """Build a RAGAS-compatible LLM wrapper backed by Groq.
@@ -44,9 +75,11 @@ def _build_evaluator_llm():
     from app.core.config import get_settings
 
     settings = get_settings()
+    eval_model = settings.groq.ragas_eval_model
+    logger.debug("RAGAS evaluator LLM: %s", eval_model)
     chat_llm = ChatGroq(
         api_key=settings.groq.api_key,
-        model=settings.groq.model,
+        model=eval_model,
         temperature=0.0,
     )
     return LangchainLLMWrapper(chat_llm)
@@ -57,19 +90,27 @@ def _build_evaluator_embeddings():
 
     ``ResponseRelevancy`` needs an embedding model to measure cosine
     similarity between the question and generated answer statements.
-    We reuse the same ``all-MiniLM-L6-v2`` SentenceTransformer model
-    that the ingestion pipeline already has cached locally — no extra
-    downloads or API keys required.
+    We use our existing Gemini EmbeddingService via an adapter class
+    to avoid running local PyTorch models inside the container and stay
+    within Cloud Run's free tier limits.
     """
-    from langchain_community.embeddings import HuggingFaceEmbeddings
     from ragas.embeddings import LangchainEmbeddingsWrapper
+    from app.rag.embeddings import embedding_service
 
-    hf_embeddings = HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-    return LangchainEmbeddingsWrapper(hf_embeddings)
+    class GeminiEmbeddingsAdapter:
+        """Adapts our standard EmbeddingService to the Langchain Embeddings interface."""
+        def __init__(self):
+            # Ensure the singleton is initialized
+            self._service = embedding_service
+            
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            # RAGAS / Langchain expect lists of floats, not numpy arrays
+            return [vec.tolist() for vec in self._service.embed_chunks(texts)]
+
+        def embed_query(self, text: str) -> list[float]:
+            return self._service.embed_query(text).tolist()
+
+    return LangchainEmbeddingsWrapper(GeminiEmbeddingsAdapter())
 
 
 def _run_ragas(
@@ -101,9 +142,20 @@ def _run_ragas(
     evaluator_llm = _build_evaluator_llm()
     evaluator_embeddings = _build_evaluator_embeddings()
 
+    # Strip [Context N] citation tags from the answer before RAGAS evaluation.
+    # ResponseRelevancy reverse-generates a question from the answer text;
+    # citation tokens cause it to produce irrelevant questions and score ~0.17.
+    # Faithfulness and ContextPrecision receive the raw answer via the same
+    # sample object but score grounding from contexts, not answer phrasing.
+    answer_for_ragas = _strip_citations(answer)
+    logger.debug(
+        "RAGAS answer after citation stripping (first 200 chars): %.200s",
+        answer_for_ragas,
+    )
+
     sample = SingleTurnSample(
         user_input=question,
-        response=answer,
+        response=answer_for_ragas,
         retrieved_contexts=contexts,
     )
     dataset = EvaluationDataset(samples=[sample])
