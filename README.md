@@ -32,7 +32,7 @@ Phase 2 ✅  Optimization     — Hybrid search · Cross-encoder reranking · RA
 Phase 3 ✅  Agentic Layer    — LangGraph agent · Intelligent routing · Conversation memory
 Phase 4 ✅  Multimodal       — Images · Tables · Gemini 2.0 Flash
 Phase 5 ✅  MLOps            — Langfuse observability · Token tracking · Prompt versioning · A/B testing · RAGAS pipeline
-Phase 6 🔜  Deployment       — Docker · CI/CD · Live on cloud
+Phase 6 ✅  Deployment       — Docker · CI/CD · Live on cloud
 ```
 
 ---
@@ -257,14 +257,28 @@ Two RAG system prompts were tested over 20 controlled query pairs:
 
 ---
 
-## 🚀 Phase 6 — Deployment *(planned)*
+## 🚀 Phase 6 — Deployment ✅
 
-**Goal:** Containerise the full stack, establish CI/CD, and deploy to cloud.
+**Goal:** Containerise the full stack, establish CI/CD, and deploy to cloud without heavy infrastructure complexity.
 
-- Multi-stage Docker build for the FastAPI app
-- Docker Compose for local full-stack (FastAPI + Qdrant + PostgreSQL + Redis)
-- GitHub Actions: lint → test → build → deploy workflow
-- Cloud deployment (target: Railway / Fly.io / GCP Cloud Run)
+### What was built
+- **Multi-stage Docker Build** (`docker/Dockerfile`) — Optimised container image using `python:3.12-slim`. Drops build-time bloat mapping down to an ultra-light <500MB artifact, bypassing heavy Torch/PyWin32 dependencies by leaning heavily into lightweight Gemini/Jina HTTP APIs.
+- **Docker Compose Orchestration** (`docker/docker-compose.yml`) — Configured a local development footprint bundling the API service with a streamlined local Qdrant container for identical cloud-like dev parity.
+- **Entrypoint Automation** (`docker/entrypoint.sh`) — Injected an idempotent schema deployment sequence (`alembic upgrade head`) to automatically manage table migrations immediately prior to the Uvicorn boot sequence on every spawn.
+- **Streamlit UI Interface** (`streamlit_app/app.py`) — Implemented an interactive conversational frontend communicating flawlessly to the FastAPI container backend on port 8000.
+- **GitHub Actions CI/CD Pipeline** (`.github/workflows/deploy.yml` & `pr_check.yml`) — Created sequential `lint -> test -> deploy` pipelines. Fully automated strict Ruff formatting gates, parameterized Pytest suites mapping dynamically to environment secrets, and deployed dual generic `curl -X POST` web hooks asynchronously refreshing Render instances for both Web & API apps on successful `main` pushes while blocking deployment triggers safely during generic Pull Requests.
+
+### 🐛 Issues Encountered & Resolutions
+
+**Issue 1: Docker Compose failing to boot due to Qdrant native health-checks**
+- **Where:** `docker/docker-compose.yml`
+- **Cause:** The Qdrant official internal Alpine images are extraordinarily barebones—lacking internal `curl`, `bash` or `wget` utilities entirely—causing Docker's health engine to eternally stall backend FastAPI initialization. 
+- **Fix:** Completely eliminated the strict container `healthcheck` layer bounding conditional polling targeting `service_healthy`. The FastAPI interface now boots dynamically parallel alongside the ultra-fast Qdrant DB startup sequence.
+
+**Issue 2: Pytest failing instantly in GitHub Actions workflows**
+- **Where:** `.github/workflows/deploy.yml`
+- **Cause:** Execution sequence threw `ModuleNotFoundError: No module named 'app'` recursively failing all 64 Pytests consistently. The isolated GitHub Actions linux runner environment natively could not trace the root directory path resolving internal Python imports without local systemic IDE-level scaffolding.
+- **Fix:** Injected `env: PYTHONPATH: .` within the `run: pytest` YAML step layer. Overrode the system environment variable routing directing GitHub runners reliably to the project working directory context.
 
 ---
 
