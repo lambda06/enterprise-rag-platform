@@ -86,3 +86,72 @@ jobs:
         run: |
           echo "Triggering Render UI deployment..."
           curl -X POST -fail "$RENDER_DEPLOY_HOOK_UI"
+
+  # Job 4: Deploy to GCP Cloud Run
+  deploy-gcp:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    # Required for Workload Identity Federation
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/453216420068/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: 'github-actions@agentic-rag-platform-495720.iam.gserviceaccount.com'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker asia-south1-docker.pkg.dev
+
+      - name: Build and Push API Image
+        run: |
+          docker build -t asia-south1-docker.pkg.dev/agentic-rag-platform-495720/enterprise-rag-repo/api:${{ github.sha }} -f docker/Dockerfile .
+          docker push asia-south1-docker.pkg.dev/agentic-rag-platform-495720/enterprise-rag-repo/api:${{ github.sha }}
+
+      - name: Deploy API to Cloud Run
+        id: deploy-api
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: enterprise-rag-api
+          image: asia-south1-docker.pkg.dev/agentic-rag-platform-495720/enterprise-rag-repo/api:${{ github.sha }}
+          region: asia-south1
+          env_vars: |
+            GEMINI_BACKEND=api_key
+          secrets: |
+            GEMINI_API_KEY=gemini-api-key:latest
+            GROQ_API_KEY=groq-api-key:latest
+            DATABASE_URL=database-url:latest
+            UPSTASH_REDIS_REST_URL=upstash-redis-rest-url:latest
+            UPSTASH_REDIS_REST_TOKEN=upstash-redis-rest-token:latest
+            QDRANT_URL=qdrant-url:latest
+            QDRANT_API_KEY=qdrant-api-key:latest
+            LANGFUSE_PUBLIC_KEY=langfuse-public-key:latest
+            LANGFUSE_SECRET_KEY=langfuse-secret-key:latest
+            JINA_API_KEY=jina-api-key:latest
+
+      - name: Build and Push Streamlit UI Image
+        run: |
+          docker build -t asia-south1-docker.pkg.dev/agentic-rag-platform-495720/enterprise-rag-repo/ui:${{ github.sha }} -f docker/Dockerfile.streamlit .
+          docker push asia-south1-docker.pkg.dev/agentic-rag-platform-495720/enterprise-rag-repo/ui:${{ github.sha }}
+
+      - name: Deploy UI to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: enterprise-rag-ui
+          image: asia-south1-docker.pkg.dev/agentic-rag-platform-495720/enterprise-rag-repo/ui:${{ github.sha }}
+          region: asia-south1
+          env_vars: |
+            BACKEND_URL=${{ steps.deploy-api.outputs.url }}
+
