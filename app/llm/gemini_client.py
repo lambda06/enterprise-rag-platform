@@ -66,13 +66,21 @@ class GeminiLLMService:
 
     def __init__(self) -> None:
         settings = get_settings()
-        api_key = settings.gemini.api_key
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY not configured in settings")
-
-        self._client = genai.Client(api_key=api_key)
         self._model_name = settings.gemini.generation_model
-        logger.info("GeminiLLMService initialised with model: %s", self._model_name)
+        
+        if settings.gcp.use_vertex_ai:
+            self._client = genai.Client(
+                vertexai=True, 
+                project=settings.gcp.project_id, 
+                location=settings.gcp.region
+            )
+            logger.info("GeminiLLMService initialised with Vertex AI (ADC), model: %s", self._model_name)
+        else:
+            api_key = settings.gemini.api_key
+            if not api_key:
+                raise RuntimeError("GEMINI_API_KEY not configured in settings (and USE_VERTEX_AI is False)")
+            self._client = genai.Client(api_key=api_key)
+            logger.info("GeminiLLMService initialised with API Key, model: %s", self._model_name)
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 

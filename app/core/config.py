@@ -157,6 +157,24 @@ class JinaSettings(BaseSettings):
         description="Jina reranker model ID"
     )
 
+
+class GCPSettings(BaseSettings):
+    """Google Cloud Platform configuration (for Vertex AI and deployment)."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="GCP_",
+        env_file=_PROJECT_ROOT / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    project_id: str = Field(default="agentic-rag-platform-495720", description="GCP Project ID")
+    region: str = Field(default="asia-south1", description="GCP Region")
+    use_vertex_ai: bool = Field(
+        default=False, 
+        description="If True, use Vertex AI (ADC) instead of Gemini API keys"
+    )
+
 class Settings(BaseSettings):
     """Root settings aggregating all configuration groups."""
 
@@ -174,6 +192,7 @@ class Settings(BaseSettings):
     redis: RedisSettings = Field(default_factory=RedisSettings)
     langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)
     jina: JinaSettings = Field(default_factory=JinaSettings)
+    gcp: GCPSettings = Field(default_factory=GCPSettings)
 
     # LLM provider selection — set LLM_PROVIDER=groq to use Groq as fallback
     llm_provider: str = Field(

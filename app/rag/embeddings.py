@@ -126,12 +126,28 @@ class EmbeddingService:
         settings = get_settings()
         self._model: str = settings.gemini.embedding_model
         self._dims: int = settings.gemini.embedding_dimensions
-        self._client = genai.Client(api_key=settings.gemini.api_key)
-        logger.info(
-            "EmbeddingService initialised: model=%s dims=%d",
-            self._model,
-            self._dims,
-        )
+        
+        if settings.gcp.use_vertex_ai:
+            self._client = genai.Client(
+                vertexai=True, 
+                project=settings.gcp.project_id, 
+                location=settings.gcp.region
+            )
+            logger.info(
+                "EmbeddingService initialised with Vertex AI (ADC): model=%s dims=%d",
+                self._model,
+                self._dims,
+            )
+        else:
+            api_key = settings.gemini.api_key
+            if not api_key:
+                raise RuntimeError("GEMINI_API_KEY not configured in settings (and USE_VERTEX_AI is False)")
+            self._client = genai.Client(api_key=api_key)
+            logger.info(
+                "EmbeddingService initialised with API Key: model=%s dims=%d",
+                self._model,
+                self._dims,
+            )
 
     # ── Public API ─────────────────────────────────────────────────────────────
 

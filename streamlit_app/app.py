@@ -8,6 +8,9 @@ import requests
 import streamlit as st
 from requests.exceptions import RequestException
 
+import google.auth.transport.requests
+import google.oauth2.id_token
+
 # --- Page Configuration & Setup ---
 st.set_page_config(
     page_title="Enterprise RAG Platform",
@@ -15,7 +18,30 @@ st.set_page_config(
     layout="wide",
 )
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
+
+def get_auth_headers() -> dict:
+    """Fetch OIDC token for secure service-to-service communication on GCP."""
+    headers = {}
+    # Only fetch OIDC token when running against a deployed Cloud Run backend
+    if "run.app" in BACKEND_URL:
+        try:
+            req = google.auth.transport.requests.Request()
+            token = google.oauth2.id_token.fetch_id_token(req, BACKEND_URL)
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        except Exception as e:
+            # Silently fallback; if backend is IAM secured, it will return 403
+            pass
+    return headers
+
+def make_request(method: str, endpoint: str, **kwargs) -> requests.Response:
+    """Wrapper around requests to automatically inject OIDC tokens."""
+    url = f"{BACKEND_URL}{endpoint}"
+    headers = kwargs.get("headers", {})
+    headers.update(get_auth_headers())
+    kwargs["headers"] = headers
+    return requests.request(method, url, **kwargs)
 
 # --- Session State Management ---
 # Persist session variables across user interactions.
@@ -65,7 +91,7 @@ with st.sidebar:
     if st.button("Clear Conversation", type="primary"):
         try:
             # Call backend to clear server-side history
-            response = requests.delete(f"{BACKEND_URL}/api/v1/chat/history/{st.session_state.session_id}")
+            response = make_request("DELETE", f"/api/v1/chat/history/{st.session_state.session_id}")
             response.raise_for_status()
             # Clear local chat UI messages
             st.session_state.messages = []
@@ -82,7 +108,7 @@ with st.sidebar:
             try:
                 # Backend expects form-data with the file under the 'file' key
                 files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
-                upload_response = requests.post(f"{BACKEND_URL}/api/v1/documents/upload", files=files)
+                upload_response = make_request("POST", "/api/v1/documents/upload", files=files)
                 upload_response.raise_for_status()
                 
                 result = upload_response.json()
@@ -157,8 +183,9 @@ if prompt := st.chat_input("Ask a question about your documents..."):
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
-                res = requests.post(
-                    f"{BACKEND_URL}/api/v1/chat",
+                res = make_request(
+                    "POST",
+                    "/api/v1/chat",
                     json={"question": prompt, "session_id": st.session_state.session_id},
                     params={"evaluate": show_eval_scores}
                 )

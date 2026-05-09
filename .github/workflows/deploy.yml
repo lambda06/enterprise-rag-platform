@@ -127,9 +127,11 @@ jobs:
           service: enterprise-rag-api
           image: asia-south1-docker.pkg.dev/agentic-rag-platform-495720/enterprise-rag-repo/api:${{ github.sha }}
           region: asia-south1
-          flags: --allow-unauthenticated --service-account=rag-api@agentic-rag-platform-495720.iam.gserviceaccount.com
+          flags: --service-account=rag-api@agentic-rag-platform-495720.iam.gserviceaccount.com
           env_vars: |
-            GEMINI_BACKEND=api_key
+            GCP_USE_VERTEX_AI=True
+            GCP_PROJECT_ID=agentic-rag-platform-495720
+            GCP_REGION=asia-south1
           secrets: |
             GEMINI_API_KEY=gemini-api-key:latest
             GROQ_API_KEY=groq-api-key:latest
@@ -153,7 +155,7 @@ jobs:
           service: enterprise-rag-ui
           image: asia-south1-docker.pkg.dev/agentic-rag-platform-495720/enterprise-rag-repo/ui:${{ github.sha }}
           region: asia-south1
-          flags: --allow-unauthenticated --service-account=rag-api@agentic-rag-platform-495720.iam.gserviceaccount.com
+          flags: --service-account=rag-api@agentic-rag-platform-495720.iam.gserviceaccount.com
           env_vars: |
             BACKEND_URL=${{ steps.deploy-api.outputs.url }}
 
