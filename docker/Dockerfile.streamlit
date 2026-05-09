@@ -17,5 +17,5 @@ EXPOSE 8501
 ARG BACKEND_URL=https://enterprise-rag-platform.onrender.com
 ENV BACKEND_URL=$BACKEND_URL
 
-# Run streamlit on port 7860 with server, headless mode enabled, and CORS disabled
-CMD ["streamlit", "run", "streamlit_app/app.py", "--server.port=7860", "--server.headless=true", "--server.enableCORS=false"]
+# Run streamlit, listening on the PORT environment variable provided by Cloud Run (default 8501)
+CMD streamlit run streamlit_app/app.py --server.port=${PORT:-8501} --server.headless=true --server.enableCORS=false
