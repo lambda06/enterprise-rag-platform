@@ -127,6 +127,7 @@ jobs:
           service: enterprise-rag-api
           image: asia-south1-docker.pkg.dev/agentic-rag-platform-495720/enterprise-rag-repo/api:${{ github.sha }}
           region: asia-south1
+          flags: --service-account=rag-api@agentic-rag-platform-495720.iam.gserviceaccount.com
           env_vars: |
             GEMINI_BACKEND=api_key
           secrets: |
@@ -152,6 +153,7 @@ jobs:
           service: enterprise-rag-ui
           image: asia-south1-docker.pkg.dev/agentic-rag-platform-495720/enterprise-rag-repo/ui:${{ github.sha }}
           region: asia-south1
+          flags: --service-account=rag-api@agentic-rag-platform-495720.iam.gserviceaccount.com
           env_vars: |
             BACKEND_URL=${{ steps.deploy-api.outputs.url }}
 
