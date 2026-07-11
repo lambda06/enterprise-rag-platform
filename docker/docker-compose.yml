@@ -50,7 +50,7 @@ services:
         BACKEND_URL: "http://api:8000"
     container_name: enterprise-rag-frontend
     ports:
-      - "8501:7860"      # Exposed on 8501, running internally on 7860
+      - "8501:8501"      # Exposed on 8501, running internally on 8501
     env_file:
       - ../.env
     depends_on:

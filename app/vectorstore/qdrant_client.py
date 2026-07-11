@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -171,56 +172,6 @@ class QdrantService:
         )
         self._collection = collection_name or settings.qdrant.collection_name
 
-    # ─── Collection Management ────────────────────────────────────────────────
-
-    def ensure_collection(self, vector_size: int | None = None) -> None:
-        """Ensure the collection exists with dense AND sparse vector configs.
-
-        If the collection already exists (e.g., an older dense-only schema)
-        it is **deleted and re-created** so that the sparse index is always
-        present.  This keeps the method idempotent with respect to the target
-        schema: callers can call it on every startup without worrying about
-        stale configs.
-
-        Args:
-            vector_size: Dense embedding dimension.  Defaults to
-                ``settings.qdrant.vector_size`` (768 for
-                gemini-embedding-2-preview with L2 normalisation).
-        """
-        if vector_size is None:
-            vector_size = get_settings().qdrant.vector_size
-
-        collections = self._client.get_collections().collections
-        names = [c.name for c in collections]
-
-        if self._collection in names:
-            # Drop the existing collection so we can apply the new schema
-            # (dense + sparse).  This is acceptable because:
-            #   1. The ingestion pipeline will re-populate on next upload.
-            #   2. Schema mismatches between dense-only and hybrid collections
-            #      silently break searches — a clean slate is safer.
-            self._client.delete_collection(self._collection)
-
-        self._client.create_collection(
-            collection_name=self._collection,
-            # Named vectors dict: supports multiple independent vector spaces
-            # per point.  "dense" uses cosine distance (semantic similarity);
-            # "sparse" will be configured separately below.
-            vectors_config={
-                DENSE_VECTOR_NAME: VectorParams(
-                    size=vector_size,
-                    distance=Distance.COSINE,
-                ),
-            },
-            # Sparse vectors are stored in a separate, dedicated index.
-            # on_disk=False keeps the index in RAM for fast lookup.
-            sparse_vectors_config={
-                SPARSE_VECTOR_NAME: SparseVectorParams(
-                    index=SparseIndexParams(on_disk=False),
-                ),
-            },
-        )
-
     # ─── Upsert ───────────────────────────────────────────────────────────────
 
     def upsert_chunks(
@@ -262,12 +213,26 @@ class QdrantService:
             # on the same page might all have an index of 0. If we only hash
             # source, page, and index, they will collide and overwrite each other.
             # We fix this by including the content_type and the correct index key.
-            meta = chunk.get("metadata", {})
+            meta = dict(chunk.get("metadata", {}))
             source = meta.get("source_filename", "")
             page = meta.get("page_number", 0)
             idx = meta.get("chunk_index", meta.get("image_index", meta.get("table_index", 0)))
+            child_idx = meta.get("child_index", idx)
+            parent_id = meta.get("parent_id", "")
             content_type = meta.get("content_type", "text")
-            hash_input = f"{source}:{page}:{idx}:{content_type}".encode("utf-8")
+            file_type = meta.get("file_type") or (Path(source).suffix.lower() if source else "")
+
+            # Enforce standardized enterprise payload metadata
+            meta["content_type"] = content_type
+            meta["file_type"] = file_type
+            if parent_id:
+                meta["parent_id"] = parent_id
+            if "image_base64" in chunk and not meta.get("image_base64"):
+                meta["image_base64"] = chunk["image_base64"]
+            if "raw_table_content" in chunk and not meta.get("raw_table_content"):
+                meta["raw_table_content"] = chunk["raw_table_content"]
+
+            hash_input = f"{source}:{page}:{parent_id}:{idx}:{child_idx}:{content_type}".encode("utf-8")
             sha_bytes = hashlib.sha256(hash_input).digest()
             chunk_uuid = uuid.UUID(bytes=bytes(sha_bytes[:16]))
 
@@ -276,8 +241,10 @@ class QdrantService:
             # so IDF scores are normalised across all chunks being upserted.
             sparse_vec = _build_sparse_vector(chunk_tokens, corpus_tokens)
 
+            payload_text = chunk.get("text", meta.get("text", ""))
+            meta["text"] = payload_text
             payload = {
-                "text": chunk.get("text", ""),
+                "text": payload_text,
                 **meta,
             }
             points.append(

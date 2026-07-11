@@ -85,6 +85,7 @@ def mock_embed_service():
     """Mock EmbeddingService that returns a deterministic unit-norm vector."""
     svc = MagicMock()
     svc.embed_image.return_value = _fake_embedding()
+    svc.embed_chunks.return_value = [_fake_embedding()]
     return svc
 
 
@@ -153,7 +154,7 @@ class TestRecordSchema:
         records = self._extract_one(extractor)
         assert len(records) == 1
         record = records[0]
-        for key in ("page_number", "image_index", "image_base64", "embedding", "content_type", "metadata"):
+        for key in ("page_number", "image_index", "image_base64", "text", "embedding", "content_type", "metadata"):
             assert key in record, f"Missing key: {key}"
 
     def test_page_number_is_one_based(self, extractor):
@@ -175,6 +176,7 @@ class TestRecordSchema:
         assert meta["page_number"] == 1
         assert meta["image_index"] == 0
         assert "source_filename" in meta
+        assert "text" in meta
 
 
 class TestEmbeddingOutput:
@@ -238,10 +240,10 @@ class TestErrorHandling:
 
         doc.extract_image.side_effect = extract_side
 
-        # First embed_image call raises; second succeeds
-        extractor._embed.embed_image.side_effect = [
+        # First embed_chunks call raises; second succeeds
+        extractor._embed.embed_chunks.side_effect = [
             RuntimeError("corrupt image"),
-            _fake_embedding(),
+            [_fake_embedding()],
         ]
 
         with patch("app.ingestion.image_extractor.Path.exists", return_value=True), patch("fitz.open", return_value=doc):

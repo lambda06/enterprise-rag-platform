@@ -192,8 +192,12 @@ class RAGPipeline:
             },
         )
 
-        # Text context — for image chunks text is "" but metadata is still useful
-        contexts: list[str] = [c.get("text", "") for c in source_chunks]
+        # Text context — prefer complete Markdown table grid (`raw_table_content`) for tables,
+        # otherwise use the full parent chunk (`text`) or image caption (`text`).
+        contexts: list[str] = [
+            c.get("metadata", {}).get("raw_table_content") or c.get("text", "")
+            for c in source_chunks
+        ]
 
         # ── Span 3: LLM generation ────────────────────────────────────────────
         is_multimodal = len(image_b64_list) > 0

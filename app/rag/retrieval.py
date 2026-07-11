@@ -99,15 +99,70 @@ class RetrievalService:
             reranker_service.rerank, query, raw_candidates, top_k
         )
 
-        # hybrid_search already returns {"text": ..., "metadata": ..., "rrf_score": ...}
-        # Strip the internal rrf_score key so the pipeline contract is unchanged.
-        return [
+        # ── Stage 3: relational context expansion from PostgreSQL ───────────
+        # Expand winning child chunks (`~350 chars`) to their full parent chunks
+        # (`~2,000 chars`) by querying the `parent_chunks` table (`id = parent_id`).
+        unexpanded = [
             {
                 "text": hit.get("text", ""),
                 "metadata": hit.get("metadata", {}),
             }
             for hit in reranked
         ]
+        return await self._expand_parents(unexpanded)
+
+    async def _expand_parents(self, chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Stage 3: Expand child chunks to their full ~2,000 char ParentChunk context from PostgreSQL.
+
+        For any retrieved chunk whose metadata contains a valid `parent_id`, this method
+        queries the `parent_chunks` table (`SELECT content ... WHERE id = parent_id`).
+        If found, the chunk's text is expanded to the complete parent document context,
+        providing the LLM with unfragmented surrounding paragraphs and headings while
+        preserving the child chunk's specific trigger text in metadata.
+        """
+        if not chunks:
+            return chunks
+
+        parent_ids = {
+            c.get("metadata", {}).get("parent_id")
+            for c in chunks
+            if c.get("metadata", {}).get("parent_id")
+        }
+        if not parent_ids:
+            return chunks
+
+        parent_map: dict[str, str] = {}
+        try:
+            from app.db.session import async_session
+            from app.models.document import ParentChunk
+            from sqlalchemy import select
+
+            async with async_session() as db:
+                stmt = select(ParentChunk).where(ParentChunk.id.in_(parent_ids))
+                result = await db.execute(stmt)
+                for parent_row in result.scalars():
+                    parent_map[parent_row.id] = parent_row.content
+        except Exception as exc:
+            logger.warning("Failed to expand parent chunks from PostgreSQL (`parent_chunks`): %s", exc)
+            return chunks
+
+        expanded: list[dict[str, Any]] = []
+        for hit in chunks:
+            meta = dict(hit.get("metadata", {}))
+            parent_id = meta.get("parent_id")
+            text = hit.get("text", "")
+
+            if parent_id and parent_id in parent_map:
+                meta["expanded_from_child"] = True
+                meta["child_text"] = text
+                text = parent_map[parent_id]
+
+            expanded.append({
+                "text": text,
+                "metadata": meta,
+            })
+
+        return expanded
 
     async def retrieve_staged(
         self,
@@ -117,7 +172,7 @@ class RetrievalService:
         """Two-stage retrieval exposing intermediate results for tracing.
 
         Identical to :meth:`retrieve` but returns both the raw hybrid-search
-        candidates **and** the final reranked results as a tuple so that
+        candidates **and** the final reranked/expanded results as a tuple so that
         callers (e.g. ``pipeline.py``) can create separate Langfuse spans
         for the hybrid-search and reranking stages.
 
@@ -130,8 +185,8 @@ class RetrievalService:
             - ``candidates``: list of up to ``top_k * RERANK_FACTOR`` dicts
               from hybrid search, each with ``text``, ``metadata``, and
               ``rrf_score`` keys.
-            - ``reranked``: top ``top_k`` dicts after cross-encoder reranking,
-              with only ``text`` and ``metadata`` keys.
+            - ``reranked``: top ``top_k`` dicts after cross-encoder reranking and
+              relational parent expansion (`_expand_parents`), with `text` and `metadata`.
         """
         candidate_k = top_k * RERANK_FACTOR
 
@@ -152,11 +207,12 @@ class RetrievalService:
             reranker_service.rerank, query, candidates, top_k
         )
 
-        # Strip rrf_score from the final result set (keeps pipeline contract)
-        reranked = [
+        # Stage 3 — relational parent expansion
+        unexpanded = [
             {"text": h.get("text", ""), "metadata": h.get("metadata", {})}
             for h in reranked_raw
         ]
+        reranked = await self._expand_parents(unexpanded)
 
         return candidates, reranked
 
@@ -165,17 +221,17 @@ class RetrievalService:
         query: str,
         top_k: int = 5,
     ) -> tuple[list[dict], list[dict], list[str]]:
-        """Two-stage retrieval that separates image base64 for multimodal prompting.
+        """Three-stage retrieval that separates image base64 for multimodal prompting.
 
         Extends :meth:`retrieve_staged` with vision support for Option B:
         image chunks have their ``image_base64`` extracted from metadata and
         returned separately so the RAG pipeline can pass them to Gemini in a
         single multimodal request.
 
-        Image chunks have ``text=""`` which gives the cross-encoder a near-zero
-        score.  To prevent images from being silently dropped, they are injected
-        back into the final result list (up to ``top_k``) after reranking —
-        scored with a ``"[image]"`` placeholder so the encoder doesn't crash.
+        Image chunks have descriptive Vision-to-Text captions (`text`) so they
+        are scored by the cross-encoder alongside text candidates. After reranking,
+        winning child chunks are expanded to their full parent context (`ParentChunk`)
+        via PostgreSQL, while image base64 strings are extracted for multimodal synthesis.
 
         Args:
             query:  The user query string.
@@ -184,7 +240,7 @@ class RetrievalService:
         Returns:
             Three-tuple ``(candidates, reranked, image_b64_list)`` where:
             - ``candidates``:      raw hybrid-search hits (for Langfuse tracing).
-            - ``reranked``:        final chunks, ``image_base64`` stripped from
+            - ``reranked``:        final expanded chunks, ``image_base64`` stripped from
                                    metadata (kept clean for the LLM context text).
             - ``image_b64_list``:  ordered list of base64 PNG strings for every
                                    image chunk in ``reranked``, passed directly
@@ -203,44 +259,29 @@ class RetrievalService:
             candidate_k,
         )
 
-        # ── Separate image and text candidates before reranking ───────────────
-        # Image chunks have text="" so they would score near-zero in the
-        # cross-encoder and be dropped.  We pull them out, score text candidates
-        # normally, then force-merge images back into the final result.
-        text_candidates: list[dict] = []
-        image_candidates: list[dict] = []
-
-        for hit in candidates:
-            if hit.get("metadata", {}).get("content_type") == "image":
-                image_candidates.append(hit)
-            else:
-                text_candidates.append(hit)
-
-        # Rerank text candidates normally
-        reranked_text: list[dict] = await asyncio.to_thread(
-            reranker_service.rerank, query, text_candidates, top_k
+        # Stage 2 — rerank all candidates jointly across modalities
+        # Image (`content_type: 'image'`) and Table (`content_type: 'table'`) chunks now carry
+        # descriptive Gemini 2.5 Flash Lite natural language captions/summaries (`text`),
+        # allowing the cross-encoder (`jina-reranker-v2-base-multilingual`) to accurately score
+        # visual charts and tabular data alongside narrative prose text.
+        reranked_raw: list[dict] = await asyncio.to_thread(
+            reranker_service.rerank, query, candidates, top_k
         )
-
-        # Merge image candidates back — cap total at top_k
-        # Images come after text chunks so text context has priority.
-        remaining_slots = max(0, top_k - len(reranked_text))
-        merged_raw = reranked_text + image_candidates[:remaining_slots]
 
         logger.debug(
-            "retrieve_with_vision: %d text chunks + %d image chunk(s) in final set",
-            len(reranked_text),
-            len(image_candidates[:remaining_slots]),
+            "retrieve_with_vision: %d total chunk(s) selected by cross-encoder before parent expansion",
+            len(reranked_raw),
         )
+
+        # Stage 3 — relational parent expansion (`_expand_parents`)
+        expanded_raw = await self._expand_parents(reranked_raw)
 
         # ── Build final return structures ─────────────────────────────────────
         reranked: list[dict] = []
         image_b64_list: list[str] = []
 
-        for hit in merged_raw:
+        for hit in expanded_raw:
             meta = dict(hit.get("metadata", {}))
-            # Extract image_base64 from metadata — do NOT send raw base64
-            # as part of the text context block (it would be enormous and
-            # meaningless to a text-only context display).
             b64 = meta.pop("image_base64", "") or ""
             if hit.get("metadata", {}).get("content_type") == "image" and b64:
                 image_b64_list.append(b64)

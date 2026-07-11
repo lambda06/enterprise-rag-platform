@@ -137,11 +137,12 @@ def _build_rag_context(question: str, chunks: list[dict[str, Any]]) -> tuple[lis
     """
     context_strings: list[str] = []
     for i, chunk in enumerate(chunks, start=1):
-        text = chunk.get("text", "").strip()
         meta = chunk.get("metadata", {})
+        text = (meta.get("raw_table_content") or chunk.get("text", "")).strip()
 
         source = (
-            meta.get("source")
+            meta.get("source_filename")
+            or meta.get("source")
             or meta.get("filename")
             or meta.get("file_name")
             or meta.get("file_path")
@@ -183,10 +184,10 @@ def _call_gemini_rag_sync(
 
     parts: list[str] = []
     for i, chunk in enumerate(chunks, start=1):
-        text = chunk.get("text", "").strip()
         meta = chunk.get("metadata", {})
+        text = (meta.get("raw_table_content") or chunk.get("text", "")).strip()
         source = (
-            meta.get("source") or meta.get("filename")
+            meta.get("source_filename") or meta.get("source") or meta.get("filename")
             or meta.get("file_name") or meta.get("file_path") or "Unknown source"
         )
         page = meta.get("page") or meta.get("page_number")

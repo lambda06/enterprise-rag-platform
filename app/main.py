@@ -13,12 +13,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes.chat import router as chat_router
 from app.api.routes.documents import router as documents_router
 
-# Configure base logging to output everything INFO and above to the terminal
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)-9s %(name)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+# Explicitly configure the 'app' logger so it is visible in the terminal even
+# after uvicorn has already claimed the root logger (which makes basicConfig a
+# no-op and silently drops all app.* log records).
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(logging.Formatter("%(levelname)-9s %(name)s - %(message)s"))
+
+_app_logger = logging.getLogger("app")
+_app_logger.setLevel(logging.INFO)
+_app_logger.addHandler(_handler)
+_app_logger.propagate = False  # Don't double-log through uvicorn's root handler
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

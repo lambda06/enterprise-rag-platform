@@ -45,6 +45,7 @@ if config.config_file_name is not None:
 # Import Base and all models so SQLAlchemy knows the full table schema.
 from app.models.conversation import Base  # noqa: E402  (after sys.path fix)
 import app.models.conversation  # noqa: E402, F401 — ensures model is registered
+import app.models.document  # noqa: E402, F401 — registers ParentChunk
 
 target_metadata = Base.metadata
 

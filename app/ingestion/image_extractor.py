@@ -1,29 +1,24 @@
 """
-Image extraction for the Enterprise RAG Platform.
+Image extraction and captioning for the Enterprise RAG Platform.
 
-Extracts embedded images from PDF pages using PyMuPDF (fitz) and produces
-768-dim Gemini embeddings for each image directly from the PIL Image object.
+Extracts embedded images from document pages, generates high-fidelity visual
+captions using Gemini (Vision-to-Text), and embeds those captions as standard
+text vectors. The raw base64 image bytes are stored directly inside the Qdrant
+payload (`metadata.image_base64`) so multimodal LLMs can inspect the visual data
+at answer generation time.
 
-Architectural note — why there is NO captioning step
-------------------------------------------------------
-In a traditional multimodal RAG pipeline, images must be converted to text
-(via a vision LLM like GPT-4o) before embedding, because text-only models
-cannot represent images.  The caption then becomes the proxy for the image
-in the vector store, losing visual detail and adding LLM latency/cost.
+Architectural advantage of Vision-to-Text + Payload Storage
+-----------------------------------------------------------
+1. **Cross-Encoder Reranker Compatibility**: Standard cross-encoders (Jina)
+   require (query_text, document_text) pairs. Captions enable accurate Stage 2
+   reranking where raw image vectors (`embed_image()`) would fail or score 0.
+2. **BM25 Sparse Keyword Indexing**: Generating a rich text summary of charts,
+   axis labels, legends, and numbers makes every visual detail searchable via
+   exact keyword matching.
+3. **Payload Efficiency**: Single text embedding vector per image chunk keeps
+   vector search fast, while preserving full visual fidelity via base64 payload.
 
-``gemini-embedding-2-preview`` is a *natively multimodal* model: it maps
-both images and text into the **same** unified 3072-dim vector space (MRL-
-truncated to 768 dims here).  This means:
-  - A PIL Image can be passed *directly* to ``EmbeddingService.embed_image()``.
-  - The resulting image vector sits in the same space as text query vectors.
-  - A text query such as "bar chart of quarterly revenue" will correctly
-    retrieve a stored image of that chart without any caption acting as an
-    intermediary.
-
-This eliminates the vision-LLM captioning step entirely, cutting one extra
-API round-trip per image and avoiding quality loss from imperfect captions.
-
-Requires: pip install pymupdf Pillow
+Requires: pip install pymupdf Pillow google-genai
 """
 
 from __future__ import annotations
@@ -83,7 +78,7 @@ class ImageExtractor:
         file_path: str | Path,
         source_filename: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Extract and embed all qualifying images from a PDF.
+        """Extract and embed all qualifying images from a PDF.  
 
         For each page, ``page.get_images(full=True)`` returns a list of
         (xref, …) tuples referencing embedded image objects.  The raw bytes
@@ -229,33 +224,68 @@ class ImageExtractor:
         image_bytes: bytes = raw["image"]
         pil_image: Image.Image = Image.open(io.BytesIO(image_bytes))
 
-        # ── Embed directly via Gemini — no captioning step needed ─────────────
-        # Because gemini-embedding-2-preview maps images and text into the same
-        # shared vector space, we can pass the PIL Image object directly to
-        # embed_image(). The resulting 768-dim vector is directly comparable to
-        # RETRIEVAL_QUERY text vectors at search time — cross-modal retrieval
-        # works out of the box without a vision LLM generating an intermediate
-        # text caption first.
-        embedding: np.ndarray = self._embed.embed_image(pil_image)
-
-        # ── Base64-encode as PNG for storage ──────────────────────────────────
+        # ── Base64-encode as PNG for storage in payload ───────────────────────
         buf = io.BytesIO()
-        # Convert to RGB first to ensure consistent PNG export (RGBA, P mode, etc.)
         pil_image.convert("RGB").save(buf, format="PNG")
         image_base64: str = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        # ── Generate Vision Caption via Gemini 2.5 Flash Lite ─────────────────
+        caption: str = self._generate_image_caption(pil_image)
+
+        # ── Embed the caption directly as standard text vector ────────────────
+        # This ensures BM25 sparse keyword search and Jina Cross-Encoder reranking
+        # work natively over the rich text description, while the raw base64
+        # bytes remain inside the payload for multimodal LLM generation.
+        embedding: np.ndarray = self._embed.embed_chunks([caption])[0]
 
         metadata = {
             "source_filename": source_filename,
             "page_number": page_number,
             "image_index": image_index,
             "content_type": "image",
+            "image_base64": image_base64,
+            "text": caption,
         }
 
         return {
             "page_number": page_number,
             "image_index": image_index,
             "image_base64": image_base64,
+            "text": caption,
             "embedding": embedding,
             "content_type": "image",
             "metadata": metadata,
         }
+
+    def _generate_image_caption(self, pil_image: Image.Image) -> str:
+        """Generate a natural language description/caption for the image using Gemini 2.5 Flash Lite.
+
+        Args:
+            pil_image: The decoded PIL Image object.
+
+        Returns:
+            A descriptive text string for embedding, keyword search, and reranking.
+        """
+        try:
+            from google import genai
+            from app.core.config import get_settings
+
+            settings = get_settings()
+            if not settings.gemini.api_key:
+                logger.debug("ImageExtractor: No Gemini API key configured; returning structural fallback caption.")
+                return f"Embedded diagram or chart ({pil_image.width}x{pil_image.height} px)."
+
+            client = genai.Client(api_key=settings.gemini.api_key)
+            prompt = (
+                "Describe this image, chart, or diagram in 3-4 detailed sentences. "
+                "Include all visible numbers, axis labels, legends, titles, and key takeaways."
+            )
+            response = client.models.generate_content(
+                model=settings.gemini.generation_model or "gemini-3.1-flash-lite-preview",
+                contents=[prompt, pil_image],
+            )
+            caption = (response.text or "").strip()
+            return caption if caption else f"Embedded visual element ({pil_image.width}x{pil_image.height} px)."
+        except Exception as exc:
+            logger.warning("ImageExtractor: caption generation failed (%s). Using structural fallback.", exc)
+            return f"Embedded diagram or chart ({pil_image.width}x{pil_image.height} px)."
