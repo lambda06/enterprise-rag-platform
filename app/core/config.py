@@ -43,12 +43,12 @@ class GeminiSettings(BaseSettings):
 
     api_key: str = Field(default="", description="Gemini API key")
     embedding_model: str = Field(
-        default="gemini-embedding-2-preview",
-        description="Gemini embedding model ID",
+        default="text-embedding-004",
+        description="Gemini embedding model ID (GA text embedding)",
     )
     embedding_dimensions: int = Field(
         default=768,
-        description="Output dimensionality (MRL sub-3072; requires manual L2 norm)",
+        description="Output dimensionality (native 768 for text-embedding-004)",
     )
     generation_model: str = Field(
         # gemini-2.5-flash is also available

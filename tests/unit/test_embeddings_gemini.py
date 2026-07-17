@@ -1,12 +1,11 @@
 """
-Unit tests for EmbeddingService (Gemini Embedding 2 preview).
+Unit tests for EmbeddingService (Google text-embedding-004).
 
 All Gemini API calls are mocked — no real API key or network access is needed.
 The tests verify:
 
-  - Correct vector shapes and L2 normalisation for each method.
-  - Correct task_type passed to the API per method.
-  - embed_image correctly converts a PIL Image and uses RETRIEVAL_DOCUMENT.
+  - Correct vector shapes (768-D float32 numpy arrays) for each method.
+  - Correct task_type passed to the API per method (RETRIEVAL_DOCUMENT vs RETRIEVAL_QUERY).
   - Retry logic surfaces success after a transient ResourceExhausted error.
 """
 
@@ -27,11 +26,8 @@ from PIL import Image
 _DIM = 768  # target embedding dimension
 
 
-def _make_raw_vector(dim: int = _DIM, *, norm: float = 2.5) -> list[float]:
-    """Return a synthetic float vector with a controlled non-unit norm.
-
-    The norm is intentionally not 1.0 to verify that _l2_normalize is applied.
-    """
+def _make_raw_vector(dim: int = _DIM, *, norm: float = 1.0) -> list[float]:
+    """Return a synthetic float vector matching the native unit norm of text-embedding-004."""
     v = np.ones(dim, dtype=np.float64) * (norm / math.sqrt(dim))
     return v.tolist()
 
@@ -58,7 +54,7 @@ def mock_settings(monkeypatch):
     """Patch get_settings() to return a minimal stub with Gemini config."""
     settings = MagicMock()
     settings.gemini.api_key = "fake-key"
-    settings.gemini.embedding_model = "gemini-embedding-2-preview"
+    settings.gemini.embedding_model = "text-embedding-004"
     settings.gemini.embedding_dimensions = _DIM
     monkeypatch.setattr("app.rag.embeddings.get_settings", lambda: settings)
     return settings
@@ -82,13 +78,14 @@ class TestEmbedQuery:
         assert result.ndim == 1
         assert result.shape == (_DIM,)
 
-    def test_l2_norm_is_unit(self, mock_settings):
+    def test_returns_float32_unit_vector(self, mock_settings):
         patcher, mock_client = _patch_client(_make_embed_response(n=1))
         with patcher:
             from app.rag.embeddings import EmbeddingService
             svc = EmbeddingService()
             result = svc.embed_query("test query")
 
+        assert result.dtype == np.float32
         norm = float(np.linalg.norm(result))
         assert abs(norm - 1.0) < 1e-5, f"Expected unit norm, got {norm}"
 
@@ -122,7 +119,7 @@ class TestEmbedChunks:
             assert isinstance(arr, np.ndarray)
             assert arr.shape == (_DIM,)
 
-    def test_all_vectors_are_l2_normalised(self, mock_settings):
+    def test_all_vectors_are_float32_numpy_arrays(self, mock_settings):
         n = 3
         patcher, mock_client = _patch_client(_make_embed_response(n=n))
         with patcher:
@@ -131,6 +128,7 @@ class TestEmbedChunks:
             results = svc.embed_chunks(["alpha", "beta", "gamma"])
 
         for arr in results:
+            assert arr.dtype == np.float32
             norm = float(np.linalg.norm(arr))
             assert abs(norm - 1.0) < 1e-5, f"Expected unit norm, got {norm}"
 
@@ -155,53 +153,7 @@ class TestEmbedChunks:
         assert "RETRIEVAL_DOCUMENT" in str(call_kwargs)
 
 
-# ─── embed_image ──────────────────────────────────────────────────────────────
 
-class TestEmbedImage:
-    def _make_image(self, width: int = 32, height: int = 32) -> Image.Image:
-        return Image.new("RGB", (width, height), color=(128, 64, 32))
-
-    def test_returns_1d_array_of_correct_dim(self, mock_settings):
-        patcher, mock_client = _patch_client(_make_embed_response(n=1))
-        with patcher:
-            from app.rag.embeddings import EmbeddingService
-            svc = EmbeddingService()
-            result = svc.embed_image(self._make_image())
-
-        assert isinstance(result, np.ndarray)
-        assert result.ndim == 1
-        assert result.shape == (_DIM,)
-
-    def test_l2_norm_is_unit(self, mock_settings):
-        patcher, mock_client = _patch_client(_make_embed_response(n=1))
-        with patcher:
-            from app.rag.embeddings import EmbeddingService
-            svc = EmbeddingService()
-            result = svc.embed_image(self._make_image())
-
-        norm = float(np.linalg.norm(result))
-        assert abs(norm - 1.0) < 1e-5
-
-    def test_uses_retrieval_document_task_type(self, mock_settings):
-        patcher, mock_client = _patch_client(_make_embed_response(n=1))
-        with patcher:
-            from app.rag.embeddings import EmbeddingService
-            svc = EmbeddingService()
-            svc.embed_image(self._make_image())
-
-        call_kwargs = mock_client.models.embed_content.call_args
-        assert "RETRIEVAL_DOCUMENT" in str(call_kwargs)
-
-    def test_accepts_rgba_image(self, mock_settings):
-        """RGBA images should be converted to RGB before encoding."""
-        patcher, mock_client = _patch_client(_make_embed_response(n=1))
-        with patcher:
-            from app.rag.embeddings import EmbeddingService
-            svc = EmbeddingService()
-            rgba_image = Image.new("RGBA", (16, 16))
-            result = svc.embed_image(rgba_image)  # must not raise
-
-        assert result.shape == (_DIM,)
 
 
 # ─── Retry logic ──────────────────────────────────────────────────────────────

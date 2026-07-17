@@ -1,16 +1,16 @@
 """
 Unit tests for ImageExtractor.
 
-All file I/O (fitz.open) and Gemini API calls (EmbeddingService.embed_image)
-are fully mocked — no real PDF file or API key is required.
+All file I/O (fitz.open) and Gemini API calls (EmbeddingService.embed_chunks)
+are mocked so tests run in memory under 1 s.
 
-Tests verify:
-  - Images ≥ 100×100 px are extracted and returned as records.
-  - Images < 100×100 px are silently filtered out.
-  - Returned records contain all required keys with correct types.
-  - Embedding shape is (768,) float32.
-  - image_base64 decodes to valid PNG bytes.
-  - A bad image (embed_image raises) is skipped without crashing.
+The suite verifies:
+  - Small images (< MIN_IMAGE_SIZE px in either dim) are filtered out.
+  - Exactly-on-threshold images (100 x 100) are kept.
+  - Image base64 strings decode cleanly to valid PNG bytes.
+  - Returned records have exact schemas conforming to vectorstore/payload specs.
+  - Embedded vectors are float32 1-D numpy arrays of length 768.
+  - A bad image (embed_chunks raises) is skipped without crashing.
   - A PDF with no images returns an empty list.
 """
 
@@ -84,7 +84,6 @@ def _make_fitz_doc(images_per_page: list[list[tuple]]) -> MagicMock:
 def mock_embed_service():
     """Mock EmbeddingService that returns a deterministic unit-norm vector."""
     svc = MagicMock()
-    svc.embed_image.return_value = _fake_embedding()
     svc.embed_chunks.return_value = [_fake_embedding()]
     return svc
 
@@ -225,7 +224,7 @@ class TestBase64Storage:
 
 class TestErrorHandling:
     def test_corrupt_image_skipped_gracefully(self, extractor):
-        """If embed_image raises for one image, the extractor skips it and continues."""
+        """If embed_chunks raises for one image, the extractor skips it and continues."""
         xref1, xref2 = 10, 20
         doc = _make_fitz_doc(images_per_page=[[
             (xref1, 0, 150, 150, 8, "rgb", "", "img1", "DCTDecode", 0),

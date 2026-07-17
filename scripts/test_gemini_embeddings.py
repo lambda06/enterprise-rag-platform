@@ -119,37 +119,6 @@ def run_tests() -> None:
         traceback.print_exc()
         failures.append("norm check: raised exception")
 
-    # ── Test 4: embed_image ──────────────────────────────────────────────────
-    print("\n--- Test 4: embed_image ---")
-    try:
-        url = "https://storage.googleapis.com/generativeai-downloads/images/scones.jpg"
-        print(f"  Downloading     : {url}")
-        resp = requests.get(url)
-        resp.raise_for_status()
-        
-        img = Image.open(io.BytesIO(resp.content))
-        print(f"  Image loaded    : {img.format} {img.mode} {img.size}")
-        
-        img_vec = svc.embed_image(img)
-        
-        dim_ok = img_vec.shape == (EXPECTED_DIM,)
-        norm = float(np.linalg.norm(img_vec))
-        norm_ok = abs(norm - 1.0) < L2_TOLERANCE
-        
-        print(f"  Shape           : {img_vec.shape} (Matches text dim: {'Yes' if dim_ok else 'No'})")
-        print(f"  L2 Norm         : {norm:.8f} (Normalized: {'Yes' if norm_ok else 'No'})")
-        
-        if dim_ok and norm_ok:
-            print(f"  Image embed check -> {PASS}")
-        else:
-            print(f"  Image embed check -> {FAIL}")
-            failures.append("embed_image: wrong dimension or unnormalized")
-            
-    except Exception:
-        print(f"  -> {FAIL} (exception)")
-        traceback.print_exc()
-        failures.append("embed_image: raised exception")
-
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 50)
     if not failures:
