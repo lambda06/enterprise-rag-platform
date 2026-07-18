@@ -30,7 +30,7 @@ def get_auth_headers() -> dict:
             token = google.oauth2.id_token.fetch_id_token(req, BACKEND_URL)
             if token:
                 headers["Authorization"] = f"Bearer {token}"
-        except Exception as e:
+        except Exception:
             # Silently fallback; if backend is IAM secured, it will return 403
             pass
     return headers

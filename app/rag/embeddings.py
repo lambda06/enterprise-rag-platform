@@ -31,14 +31,11 @@ Requires: pip install google-genai tenacity Pillow
 
 from __future__ import annotations
 
-import base64
-import io
 import logging
 
 import numpy as np
 from google import genai
 from google.genai import types
-from PIL import Image
 from tenacity import (
     retry,
     retry_if_exception_type,

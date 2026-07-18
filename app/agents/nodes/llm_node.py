@@ -126,35 +126,6 @@ MAX_ANSWER_TOKENS: int = 1024
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _build_rag_context(question: str, chunks: list[dict[str, Any]]) -> tuple[list[str], str]:
-    """
-    Build the context chunks list and formatted question string for RAG generation.
-
-    Returns:
-        (context_strings, question_str) where context_strings is a list of
-        formatted chunk strings, one per chunk, and question_str is the plain
-        question ready to append.
-    """
-    context_strings: list[str] = []
-    for i, chunk in enumerate(chunks, start=1):
-        meta = chunk.get("metadata", {})
-        text = (meta.get("raw_table_content") or chunk.get("text", "")).strip()
-
-        source = (
-            meta.get("source_filename")
-            or meta.get("source")
-            or meta.get("filename")
-            or meta.get("file_name")
-            or meta.get("file_path")
-            or "Unknown source"
-        )
-        page = meta.get("page") or meta.get("page_number")
-        source_label = f"{source}, page {page}" if page else source
-
-        context_strings.append(f"[Context {i}] (Source: {source_label})\n{text}")
-
-    return context_strings, question
-
 
 # ---------------------------------------------------------------------------
 # Gemini sync callers (dispatched to thread pool)

@@ -2,7 +2,6 @@
 Unit tests for hierarchical chunking (`chunk_pages_hierarchical` in `chunker.py`).
 """
 
-import pytest
 from app.ingestion.chunker import chunk_pages, chunk_pages_hierarchical
 
 

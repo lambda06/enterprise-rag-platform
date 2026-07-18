@@ -92,18 +92,19 @@ def _build_initial_state(
                     span here so that node spans nest correctly underneath it.
         evaluate:   If ``True``, ``eval_node`` will run RAGAS scoring.
                     Defaults to ``False`` for latency-sensitive paths.
+        turn_id:    Optional external ID for the current interaction.
 
     Returns:
         A fully initialised ``AgentState`` dict ready for graph invocation.
     """
     return AgentState(
-        # ── Caller-supplied ──────────────────────────────────────────────
+        # ── Caller-supplied ─────────────────────────────────────────────
         current_question=question.strip(),
         session_id=session_id.strip(),
         evaluate=evaluate,
         lf_trace=lf_trace,    # gives every node access to the parent trace
 
-        # ── Node-owned — start empty; each node writes its own keys ──────
+        # ── Node-owned — start empty; each node writes its own keys ───────
         messages=[],
         routing_decision="",
         cache_hit=False,
@@ -113,6 +114,7 @@ def _build_initial_state(
         evaluation_scores={},
         token_usage={},   # populated by router_node and llm_node
         error="",
+        turn_id=None,     # populated by memory_node after DB flush
     )
 
 
@@ -247,6 +249,7 @@ class AgentService:
             "agent-chat",
             input={"question": question},
             session_id=session_id,
+            user_id=session_id,   # enables per-user analytics in Langfuse
             tags=["langgraph", "agent"],
         )
 

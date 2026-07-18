@@ -5,6 +5,7 @@ FastAPI application entry point for the Enterprise RAG Platform.
 from contextlib import asynccontextmanager
 
 import logging
+import os
 import sys
 
 from fastapi import FastAPI
@@ -47,10 +48,24 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS: allow all origins for development (restrict in production)
+# CORS: explicit allowed origins.
+# Wildcard + allow_credentials=True is rejected by all browsers for credentialed
+# requests (CORS spec). We read from CORS_ORIGINS env var (comma-separated) so
+# deployments can configure without a code change.
+_cors_origins_env = os.getenv("CORS_ORIGINS", "")
+if _cors_origins_env:
+    _allowed_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+else:
+    # Sensible defaults for local development and Streamlit frontend.
+    _allowed_origins = [
+        "http://localhost:8501",   # Streamlit default port
+        "http://localhost:3000",   # Next.js dev
+        "http://localhost:8000",   # FastAPI self (for Swagger UI)
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

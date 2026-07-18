@@ -8,6 +8,7 @@ merges deltas back into the canonical state automatically.
 """
 
 from __future__ import annotations
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Why TypedDict and NOT a Pydantic BaseModel?
@@ -54,9 +55,9 @@ class AgentState(dict):
     ROUTER          → routing_decision
     RAG_RETRIEVAL   → retrieved_chunks, cache_hit
     RERANKER        → reranked_chunks           (future node)
-    MEMORY          → messages
+    MEMORY          → messages, turn_id
     GENERATOR       → final_answer
-    EVALUATOR       → evaluation_scores         (future node)
+    EVALUATOR       → evaluation_scores
     ANY             → error (set on exception, checked by every node)
 
     All fields are Optional so a node only needs to return the keys it mutated.
@@ -245,4 +246,14 @@ class AgentState(dict):
 
     Set by ``_build_initial_state`` in ``agent_service.py``.
     Reset to ``None`` at graph teardown — never persisted between turns.
+    """
+
+    turn_id: Optional[str]
+    """
+    UUID string of the ``ConversationTurn`` PostgreSQL row inserted by ``memory_node``.
+
+    Threaded through state so that ``eval_node`` — which runs after memory —
+    can UPDATE the same row with RAGAS scores once they are computed.
+
+    ``None`` when the memory insert was skipped (empty question/answer or DB error).
     """

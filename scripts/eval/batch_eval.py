@@ -52,13 +52,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 # ─── Ensure project root is on sys.path so `app.*` imports work ──────────────
 # This script lives at scripts/eval/batch_eval.py, so two levels up is root.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Load .env so GROQ_API_KEY and GROQ_MODEL are available
-from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")  # noqa: E402
 
 logging.basicConfig(

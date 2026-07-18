@@ -13,13 +13,10 @@ Run from the project root with:
 
 from __future__ import annotations
 
-import io
 import sys
 import traceback
 
 import numpy as np
-import requests
-from PIL import Image
 
 # ── Make sure app/ is importable when run as a script ─────────────────────────
 from pathlib import Path

@@ -38,12 +38,8 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
-    Distance,
     PointStruct,
-    SparseIndexParams,
     SparseVector,
-    SparseVectorParams,
-    VectorParams,
 )
 
 from app.core.config import get_settings

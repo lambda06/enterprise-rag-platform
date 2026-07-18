@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.core.config import get_settings
+from app.core.config import get_settings  # noqa: E402
 
 # Load .env from project root
 env_path = PROJECT_ROOT / ".env"
@@ -98,8 +98,6 @@ async def check_postgres() -> tuple[bool, str]:
     if not url:
         return False, "DATABASE_URL not set"
 
-        from redis.asyncio.connection import Connection
-        from redis.asyncio.connection import Connection
     # asyncpg expects postgresql://, not postgresql+asyncpg:// (SQLAlchemy format)
     if url.startswith("postgresql+asyncpg://"):
         url = url.replace("postgresql+asyncpg://", "postgresql://", 1)

@@ -333,8 +333,10 @@ async def router_node(state: AgentState) -> dict:
     except Exception as exc:  # noqa: BLE001
         logger.exception("router_node failed: %s", exc)
         tracer.end_span(router_span, output={"error": str(exc)})
+        # Fail cheap: on classification error, refuse rather than triggering a
+        # full retrieval + generation cycle against a degraded API.
         return {
-            "routing_decision": ROUTE_RAG,
+            "routing_decision": ROUTE_OUT_OF_SCOPE,
             "token_usage": {},
             "error": f"Router classification failed: {exc}",
         }

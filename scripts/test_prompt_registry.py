@@ -53,7 +53,7 @@ def main() -> None:
     all_ok &= _print_result(
         "Test 1 (first fetch -> langfuse)",
         ok1,
-        f"expected source 'langfuse'",
+        "expected source 'langfuse'",
         {
             "source": r1.source,
             "version": r1.version,
@@ -67,7 +67,7 @@ def main() -> None:
     all_ok &= _print_result(
         "Test 2 (immediate repeat -> cache)",
         ok2,
-        f"expected source 'cache'",
+        "expected source 'cache'",
         {"source": r2.source, "version": r2.version, "text_len": len(r2.text)},
     )
 
@@ -78,7 +78,7 @@ def main() -> None:
     all_ok &= _print_result(
         "Test 3 (after invalidate -> langfuse)",
         ok3,
-        f"expected source 'langfuse'",
+        "expected source 'langfuse'",
         {"source": r3.source, "version": r3.version, "text_len": len(r3.text)},
     )
 
@@ -118,7 +118,7 @@ def main() -> None:
     all_ok &= _print_result(
         "Test 5 (invalid Langfuse key -> fallback)",
         ok5,
-        f"expected source 'fallback'",
+        "expected source 'fallback'",
         {"source": r5.source, "version": r5.version, "text_len": len(r5.text)},
     )
 

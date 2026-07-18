@@ -11,14 +11,12 @@ The tests verify:
 
 from __future__ import annotations
 
-import base64
 import math
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from PIL import Image
 
 
 # ─── Stub helpers ─────────────────────────────────────────────────────────────
@@ -97,7 +95,6 @@ class TestEmbedQuery:
             svc.embed_query("find me something")
 
         call_kwargs = mock_client.models.embed_content.call_args
-        config = call_kwargs.kwargs.get("config") or call_kwargs.args[2] if call_kwargs.args else None
         # The config is a types.EmbedContentConfig; check its task_type attribute
         assert "RETRIEVAL_QUERY" in str(call_kwargs)
 

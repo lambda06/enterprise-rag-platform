@@ -14,9 +14,9 @@ from typing import Any
 
 import numpy as np
 
-from app.ingestion.chunker import chunk_pages, chunk_pages_hierarchical
+from app.ingestion.chunker import chunk_pages_hierarchical
 from app.ingestion.image_extractor import ImageExtractor
-from app.ingestion.parser import parse_document, parse_pdf
+from app.ingestion.parser import parse_document
 from app.ingestion.table_extractor import TableExtractor
 from app.rag.embeddings import get_embedding_service
 from app.vectorstore.qdrant_client import QdrantService

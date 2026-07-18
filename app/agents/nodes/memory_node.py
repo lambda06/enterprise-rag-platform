@@ -134,6 +134,7 @@ async def memory_node(state: AgentState) -> dict[str, Any]:
     # Database operations                                                  #
     # ------------------------------------------------------------------ #
     try:
+        turn_id: str | None = None  # populated after DB flush if insert succeeds
         async with async_session() as db:
 
             # ── Job 1: Persist the current turn ─────────────────────────
@@ -151,6 +152,7 @@ async def memory_node(state: AgentState) -> dict[str, Any]:
                 # Flush to assign DB-generated values (id, created_at)
                 # before the session closes; commit happens on context exit.
                 await db.flush()
+                turn_id = str(turn.id)  # capture before session closes
                 logger.info(
                     "memory_node: persisted turn id=%s for session=%r",
                     turn.id,
@@ -199,6 +201,7 @@ async def memory_node(state: AgentState) -> dict[str, Any]:
 
         return {
             "messages": updated_messages,
+            "turn_id": turn_id,  # None if insert was skipped
             "error": "",
         }
 

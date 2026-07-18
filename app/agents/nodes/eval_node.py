@@ -59,33 +59,18 @@ EvaluationResult fields logged to Langfuse spans
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
+
+from sqlalchemy import update
 
 from app.agents.state import AgentState
+from app.db.session import async_session
 from app.evaluation.ragas_evaluator import evaluate_response
+from app.models.conversation import ConversationTurn
 from app.observability.langfuse_tracer import tracer
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class EvaluationResult:
-    """Structured container for the outcome of one eval_node execution.
-
-    Attributes:
-        scores: RAGAS metric scores (or ``{"error": str}`` on failure, or ``{}``
-                when skipped).
-        content_types_evaluated: Content-type labels of the chunks that were
-                actually passed to RAGAS (e.g. ``['text', 'table']``).  Empty
-                when evaluation was skipped.
-        skipped_reason: ``None`` if RAGAS ran normally; otherwise a short
-                snake_case string explaining why evaluation was skipped.
-    """
-
-    scores: dict[str, Any] = field(default_factory=dict)
-    content_types_evaluated: list[str] = field(default_factory=list)
-    skipped_reason: Optional[str] = None
 
 
 def _derive_content_types(chunks: list[dict[str, Any]]) -> list[str]:
@@ -289,12 +274,37 @@ async def eval_node(state: AgentState) -> dict[str, Any]:
                 {k: v for k, v in scores.items()},
             )
 
+        # ── Persist RAGAS scores to PostgreSQL ──────────────────────────
+        # eval_node runs after memory_node, so the ConversationTurn row already
+        # exists. We UPDATE it with the computed scores using the turn_id that
+        # memory_node threaded through state. This fixes the bug where ragas_scores
+        # was always NULL in the history API.
+        turn_id: str | None = state.get("turn_id")
+        if turn_id and scores and "error" not in scores:
+            try:
+                async with async_session() as db:
+                    await db.execute(
+                        update(ConversationTurn)
+                        .where(ConversationTurn.id == turn_id)
+                        .values(ragas_scores=scores)
+                    )
+                    await db.commit()
+                logger.info(
+                    "eval_node: persisted RAGAS scores to DB for turn_id=%s", turn_id
+                )
+            except Exception as db_exc:  # noqa: BLE001
+                # DB update failure is non-fatal — scores are still returned
+                # in the API response and visible in Langfuse.
+                logger.warning(
+                    "eval_node: failed to persist RAGAS scores to DB: %s", db_exc
+                )
+
         tracer.end_span(
             eval_span,
             output={
-                "chunks_evaluated":       len(contexts),
+                "chunks_evaluated":        len(contexts),
                 "content_types_evaluated": content_types_evaluated,
-                "skipped_reason":         None,
+                "skipped_reason":          None,
                 **{k: round(float(v), 4) if isinstance(v, float) else v
                    for k, v in scores.items()},
             },

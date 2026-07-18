@@ -20,9 +20,7 @@ Tests verify:
 
 from __future__ import annotations
 
-from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -217,8 +215,8 @@ class TestMarkdownConversion:
         rows = [["A", "B", "C"], ["only_one"]]
         md = self._md(rows)
         # Every pipe-delimited row should have the same column count
-        lines = [l for l in md.splitlines() if l.startswith("|")]
-        col_counts = [l.count("|") for l in lines]
+        lines = [line for line in md.splitlines() if line.startswith("|")]
+        col_counts = [line.count("|") for line in lines]
         assert len(set(col_counts)) == 1, f"Column counts differ: {col_counts}"
 
     def test_header_is_first_row(self):

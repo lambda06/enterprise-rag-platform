@@ -94,21 +94,30 @@ def main():
                 question = str(raw_input)
             question_snippet = (question[:60] + '…') if len(question) > 60 else question
             parts = []
-            if rel   is not None: parts.append(f"rel={rel:.3f}")
-            if faith is not None: parts.append(f"faith={faith:.3f}")
-            if cp    is not None: parts.append(f"ctx={cp:.3f}")
+            if rel is not None:
+                parts.append(f"rel={rel:.3f}")
+            if faith is not None:
+                parts.append(f"faith={faith:.3f}")
+            if cp is not None:
+                parts.append(f"ctx={cp:.3f}")
             scores_str = '  '.join(parts) or 'no scores'
             print(f"  [{ts}] {variant}: {scores_str}  | {question_snippet}")
 
         # Sort into our A and B buckets
         if variant == 'A':
-            if rel is not None: variant_a_scores['answer_relevancy'].append(rel)
-            if faith is not None: variant_a_scores['faithfulness'].append(faith)
-            if cp is not None: variant_a_scores['llm_context_precision_without_reference'].append(cp)
+            if rel is not None:
+                variant_a_scores['answer_relevancy'].append(rel)
+            if faith is not None:
+                variant_a_scores['faithfulness'].append(faith)
+            if cp is not None:
+                variant_a_scores['llm_context_precision_without_reference'].append(cp)
         elif variant == 'B':
-            if rel is not None: variant_b_scores['answer_relevancy'].append(rel)
-            if faith is not None: variant_b_scores['faithfulness'].append(faith)
-            if cp is not None: variant_b_scores['llm_context_precision_without_reference'].append(cp)
+            if rel is not None:
+                variant_b_scores['answer_relevancy'].append(rel)
+            if faith is not None:
+                variant_b_scores['faithfulness'].append(faith)
+            if cp is not None:
+                variant_b_scores['llm_context_precision_without_reference'].append(cp)
             
     print("\n--- A/B Test Analysis ---")
     print(f"Scanned traces. Found {valid_count} recent traces with valid RAGAS scores and 'llm-generation' variant tags.")
@@ -116,7 +125,7 @@ def main():
     count_a = len(variant_a_scores['answer_relevancy']) if variant_a_scores['answer_relevancy'] else 0
     count_b = len(variant_b_scores['answer_relevancy']) if variant_b_scores['answer_relevancy'] else 0
     
-    print(f"\nSample Sizes:")
+    print("\nSample Sizes:")
     print(f" - Variant A (Version 1): {count_a}")
     print(f" - Variant B (Version 2): {count_b}")
     
