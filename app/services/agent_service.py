@@ -37,6 +37,7 @@ from typing import Any
 from app.agents.graph import agent_graph
 from app.agents.state import AgentState
 from app.cache.redis_client import cache_service
+from app.guardrails.input_guard import GuardrailResult, check as guardrail_check
 from app.observability.langfuse_tracer import tracer
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,7 @@ def _build_initial_state(
     session_id: str,
     lf_trace: Any,
     evaluate: bool = False,
+    guardrail_result: GuardrailResult | None = None,
 ) -> AgentState:
     """
     Construct the initial ``AgentState`` dict passed to ``agent_graph.ainvoke``.
@@ -115,6 +117,14 @@ def _build_initial_state(
         token_usage={},   # populated by router_node and llm_node
         error="",
         turn_id=None,     # populated by memory_node after DB flush
+        guardrail_result=(
+            {
+                "passed":          guardrail_result.passed,
+                "violation_type":  guardrail_result.violation_type,
+                "pii_types_found": guardrail_result.pii_types_found,
+            }
+            if guardrail_result is not None else None
+        ),
     )
 
 
@@ -156,6 +166,9 @@ def _extract_response(completed_state: dict[str, Any]) -> dict[str, Any]:
         "evaluation_scores": completed_state.get("evaluation_scores", {}),
         "error":             completed_state.get("error", ""),
         "cache_hit":         False,
+        "guardrail_violation": (
+            completed_state.get("guardrail_result", {}) or {}
+        ).get("violation_type"),
     }
 
 
@@ -230,6 +243,7 @@ class AgentService:
                 "evaluation_scores": {},
                 "error": "Question must not be empty.",
                 "cache_hit": False,
+                "guardrail_violation": None,
             }
 
         if not session_id:
@@ -240,7 +254,39 @@ class AgentService:
                 "evaluation_scores": {},
                 "error": "session_id must not be empty.",
                 "cache_hit": False,
+                "guardrail_violation": None,
             }
+
+        # ── Input guardrails (Step 0) ──────────────────────────────────────
+        # Runs before any cache lookup, Langfuse trace, or LLM call.
+        # Zero token cost. Returns in <5 ms (pure regex, no I/O).
+        guard = guardrail_check(question)
+
+        if not guard.passed:
+            # Blocking violation: return immediately, no external call made.
+            logger.info(
+                "AgentService: request blocked by guardrail violation=%r session=%r",
+                guard.violation_type,
+                session_id,
+            )
+            return {
+                "answer":             guard.user_message,
+                "routing_decision":   "guardrail_blocked",
+                "sources":            [],
+                "evaluation_scores":  {},
+                "error":              "",
+                "cache_hit":          False,
+                "guardrail_violation": guard.violation_type,
+            }
+
+        # PII was detected but request is allowed — use sanitized (masked) input.
+        if guard.pii_types_found:
+            logger.info(
+                "AgentService: PII masked before processing pii_types=%r session=%r",
+                guard.pii_types_found,
+                session_id,
+            )
+        question = guard.sanitized_input
 
         # ── Langfuse trace — wraps the entire request lifecycle ──────────
         # One trace per user question. Spans inside capture individual stages.
@@ -289,7 +335,9 @@ class AgentService:
                 question[:80],
             )
 
-            initial_state = _build_initial_state(question, session_id, graph_span, evaluate)
+            initial_state = _build_initial_state(
+                question, session_id, graph_span, evaluate, guardrail_result=guard
+            )
             completed_state: dict[str, Any] = await agent_graph.ainvoke(initial_state)
             response = _extract_response(completed_state)
 

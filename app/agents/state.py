@@ -257,3 +257,21 @@ class AgentState(dict):
 
     ``None`` when the memory insert was skipped (empty question/answer or DB error).
     """
+
+    guardrail_result: Optional[dict]
+    """
+    Serialised ``GuardrailResult`` from the input guardrail check, set by
+    ``AgentService`` before graph invocation.
+
+    Schema::
+
+        {
+            "passed":          bool,
+            "violation_type":  str | None,   # e.g. "pii_detected"
+            "pii_types_found": list[str],    # e.g. ["email", "aadhaar"]
+        }
+
+    ``None`` when the guardrail was not run (e.g. in unit tests that invoke
+    the graph directly without going through ``AgentService``).
+    Persisted in state so Langfuse spans can log the guardrail outcome.
+    """

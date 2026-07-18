@@ -82,6 +82,13 @@ class ChatResponse(BaseModel):
         default="",
         description="Non-empty if a non-fatal error occurred during processing.",
     )
+    guardrail_violation: str | None = Field(
+        default=None,
+        description=(
+            "Set when a guardrail blocked the request. Possible values: "
+            "'prompt_injection', 'malicious_input', 'query_too_long', 'pii_detected'."
+        ),
+    )
 
 
 class TurnSummary(BaseModel):
@@ -141,6 +148,18 @@ async def chat(
         evaluate=evaluate,
     )
 
+    # Guardrail blocked the request — surface as 422 Unprocessable Entity.
+    # 422 is semantically correct: the input was syntactically valid but
+    # failed content-level validation (injection, PII, length).
+    if result.get("routing_decision") == "guardrail_blocked":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": result.get("answer", ""),
+                "guardrail_violation": result.get("guardrail_violation"),
+            },
+        )
+
     # Surface hard errors as HTTP 500 — but only when the agent returned
     # an empty answer AND an error.  A non-empty answer with an error means
     # the graph degraded gracefully, which is fine to return as 200.
@@ -158,6 +177,7 @@ async def chat(
         evaluation_scores=result.get("evaluation_scores", {}),
         cache_hit=result.get("cache_hit", False),
         error=result.get("error", ""),
+        guardrail_violation=result.get("guardrail_violation"),
     )
 
 
